@@ -1,0 +1,307 @@
+//@version=5
+// ─────────────────────────────────────────────────────────────────────────────
+// IREN Signal Pro — Buy/Sell signals + probability-weighted targets + hold time
+//
+// Designed for NASDAQ:IREN (works on any symbol/timeframe).
+//
+// What it does:
+//   • BUY / SELL signals from an ATR trailing-stop engine (UT-Bot style flip)
+//     confirmed by trend (EMA 9/21), momentum (RSI) and volume.
+//   • Two targets per signal, sized by volatility (ATR):
+//       T1 = high-probability target   (default 1.0 × ATR)
+//       T2 = stretch target            (default 2.2 × ATR)
+//   • Self-measuring statistics: the script tracks every past signal on the
+//     chart and reports the REAL historical hit rate of T1 and T2 and the
+//     median holding time, so "how likely" and "how long" are measured on
+//     IREN itself — not guessed.
+//   • Live dashboard: active signal, age, P&L, targets, expected remaining
+//     hold time, sample size.
+//   • Alerts for BUY, SELL, T1 hit, T2 hit and exits.
+//
+// Honest disclaimer: no target is ever reached "for sure". T1 is the target
+// with the highest measured probability; the dashboard shows you the exact
+// historical hit rate so you can judge it yourself.
+// ─────────────────────────────────────────────────────────────────────────────
+indicator("IREN Signal Pro — Buy/Sell + Targets + Hold Time",
+     shorttitle = "IREN Signal Pro",
+     overlay = true,
+     max_labels_count = 500,
+     max_lines_count = 500)
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+grpSig = "Signal engine"
+atrLen          = input.int(10,   "ATR length",                        minval = 1,   group = grpSig)
+atrMult         = input.float(1.8,"ATR sensitivity (trailing stop)",   minval = 0.1, step = 0.1, group = grpSig,
+     tooltip = "Lower = more signals (scalping). Higher = fewer, longer signals (swing). 1.5–2.0 works well on IREN 15m; use 2.5–3.0 on the daily chart.")
+minScore        = input.int(2,    "Min confirmations required (0–3)",  minval = 0, maxval = 3, group = grpSig,
+     tooltip = "Confirmations: EMA trend, RSI momentum, volume. 3 = only A+ signals, 2 = balanced (default), 0 = every flip.")
+allowShorts     = input.bool(true,"Show SELL (short) entries",         group = grpSig)
+confirmBarClose = input.bool(true,"Confirm signals on bar close (no repaint)", group = grpSig)
+
+grpFlt = "Confirmations"
+emaFastLen = input.int(9,    "Fast EMA",                     group = grpFlt)
+emaSlowLen = input.int(21,   "Slow EMA",                     group = grpFlt)
+rsiLen     = input.int(14,   "RSI length",                   group = grpFlt)
+volLen     = input.int(20,   "Volume average length",        group = grpFlt)
+volMult    = input.float(1.0,"Volume must exceed × average", step = 0.1, group = grpFlt)
+
+grpTgt = "Targets"
+t1Mult = input.float(1.0, "T1 — high-probability target (× ATR)", step = 0.1, group = grpTgt)
+t2Mult = input.float(2.2, "T2 — stretch target (× ATR)",          step = 0.1, group = grpTgt)
+
+grpUi = "Display"
+showTable     = input.bool(true, "Show stats dashboard", group = grpUi)
+tablePosInp   = input.string("top_right", "Dashboard position",
+     options = ["top_right", "top_left", "bottom_right", "bottom_left"], group = grpUi)
+showEmaRibbon = input.bool(true, "Show EMA 9/21 ribbon", group = grpUi)
+showTrail     = input.bool(true, "Show ATR trailing stop", group = grpUi)
+
+// ── Colors ───────────────────────────────────────────────────────────────────
+colBull  = color.new(#089981, 0)
+colBear  = color.new(#f23645, 0)
+colT1    = color.new(#26c281, 0)
+colT2    = color.new(#00bcd4, 0)
+colFlat  = color.new(#787b86, 0)
+
+// ── Core series ──────────────────────────────────────────────────────────────
+atrVal  = ta.atr(atrLen)
+emaF    = ta.ema(close, emaFastLen)
+emaS    = ta.ema(close, emaSlowLen)
+rsiVal  = ta.rsi(close, rsiLen)
+volAvg  = ta.sma(volume, volLen)
+
+// ATR trailing stop (UT-Bot style)
+nLoss = atrMult * atrVal
+var float trail = na
+trail := close > nz(trail[1]) and close[1] > nz(trail[1]) ? math.max(nz(trail[1]), close - nLoss) :
+     close < nz(trail[1]) and close[1] < nz(trail[1]) ? math.min(nz(trail[1]), close + nLoss) :
+     close > nz(trail[1]) ? close - nLoss : close + nLoss
+
+var int posState = 0
+posState := close > trail ? 1 : close < trail ? -1 : nz(posState[1])
+
+baseBuy  = ta.crossover(close, trail)
+baseSell = ta.crossunder(close, trail)
+
+// Confirmation score
+volOk      = not na(volAvg) and volume > volAvg * volMult
+scoreLong  = (emaF > emaS ? 1 : 0) + (rsiVal > 50 ? 1 : 0) + (volOk ? 1 : 0)
+scoreShort = (emaF < emaS ? 1 : 0) + (rsiVal < 50 ? 1 : 0) + (volOk ? 1 : 0)
+longOk     = scoreLong  >= minScore
+shortOk    = scoreShort >= minScore
+barOk      = not confirmBarClose or barstate.isconfirmed
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+// Historical hit rate of an outcome array (needs ≥5 samples to be meaningful)
+f_rate(arr) =>
+    float r = na
+    if array.size(arr) >= 5
+        r := array.avg(arr) * 100
+    r
+
+// Format a bar count as human time on the current chart timeframe
+f_dur(float nBars) =>
+    string out = "—"
+    if not na(nBars)
+        float mins = nBars * timeframe.in_seconds() / 60.0
+        out := mins < 90 ? str.format("~{0,number,#} min", mins) :
+             mins < 60 * 36 ? str.format("~{0,number,#.#} h", mins / 60) :
+             str.format("~{0,number,#.#} d", mins / 1440)
+    out
+
+f_pctTxt(float r) =>
+    na(r) ? "" : str.format(" · hit {0,number,#}%", r)
+
+// ── Trade state ──────────────────────────────────────────────────────────────
+var int   dir        = 0        // 1 = long, -1 = short, 0 = flat
+var float entryPrice = na
+var int   entryBar   = na
+var float t1         = na
+var float t2         = na
+var bool  t1Hit      = false
+var bool  t2Hit      = false
+var int   t1HitBar   = na
+var line  t1Line     = na
+var line  t2Line     = na
+var label t1Lab      = na
+var label t2Lab      = na
+
+// Historical statistics (long / short kept separate)
+var lHold  = array.new_float()  // bars held per closed long signal
+var lT1    = array.new_float()  // 1 if T1 was hit, else 0
+var lT2    = array.new_float()
+var lToT1  = array.new_float()  // bars from entry to T1 hit
+var sHold  = array.new_float()
+var sT1    = array.new_float()
+var sT2    = array.new_float()
+var sToT1  = array.new_float()
+
+f_pushCapped(arr, val) =>
+    array.push(arr, val)
+    if array.size(arr) > 300
+        array.shift(arr)
+
+// Per-bar event flags (for plots & alerts)
+bool longEntry  = false
+bool shortEntry = false
+bool longExit   = false
+bool shortExit  = false
+bool t1HitNow   = false
+bool t2HitNow   = false
+
+// ── 1. Track target hits on the open signal ─────────────────────────────────
+if dir == 1 and bar_index > entryBar
+    if not t1Hit and high >= t1
+        t1Hit := true
+        t1HitBar := bar_index
+        t1HitNow := true
+        line.set_style(t1Line, line.style_solid)
+        label.new(bar_index, t1, "T1 ✓", style = label.style_label_down, color = color.new(colT1, 20), textcolor = color.white, size = size.tiny)
+    if not t2Hit and high >= t2
+        t2Hit := true
+        t2HitNow := true
+        line.set_style(t2Line, line.style_solid)
+        label.new(bar_index, t2, "T2 ✓", style = label.style_label_down, color = color.new(colT2, 20), textcolor = color.white, size = size.tiny)
+if dir == -1 and bar_index > entryBar
+    if not t1Hit and low <= t1
+        t1Hit := true
+        t1HitBar := bar_index
+        t1HitNow := true
+        line.set_style(t1Line, line.style_solid)
+        label.new(bar_index, t1, "T1 ✓", style = label.style_label_up, color = color.new(colT1, 20), textcolor = color.white, size = size.tiny)
+    if not t2Hit and low <= t2
+        t2Hit := true
+        t2HitNow := true
+        line.set_style(t2Line, line.style_solid)
+        label.new(bar_index, t2, "T2 ✓", style = label.style_label_up, color = color.new(colT2, 20), textcolor = color.white, size = size.tiny)
+
+// ── 2. Exits (a trailing-stop flip always closes the open signal) ───────────
+if dir == 1 and baseSell and barOk
+    f_pushCapped(lHold, bar_index - entryBar)
+    f_pushCapped(lT1, t1Hit ? 1.0 : 0.0)
+    f_pushCapped(lT2, t2Hit ? 1.0 : 0.0)
+    if t1Hit
+        f_pushCapped(lToT1, t1HitBar - entryBar)
+    longExit := true
+    dir := 0
+if dir == -1 and baseBuy and barOk
+    f_pushCapped(sHold, bar_index - entryBar)
+    f_pushCapped(sT1, t1Hit ? 1.0 : 0.0)
+    f_pushCapped(sT2, t2Hit ? 1.0 : 0.0)
+    if t1Hit
+        f_pushCapped(sToT1, t1HitBar - entryBar)
+    shortExit := true
+    dir := 0
+
+// ── 3. Entries ───────────────────────────────────────────────────────────────
+longEntry  := dir != 1 and posState == 1 and longOk and barOk
+shortEntry := allowShorts and dir != -1 and posState == -1 and shortOk and barOk
+
+if longEntry
+    dir := 1
+    entryPrice := close
+    entryBar := bar_index
+    t1 := close + t1Mult * atrVal
+    t2 := close + t2Mult * atrVal
+    t1Hit := false
+    t2Hit := false
+    t1HitBar := na
+    histT1 = f_rate(lT1)
+    histT2 = f_rate(lT2)
+    medHold = array.size(lHold) >= 5 ? array.median(lHold) : na
+    gradeTxt = scoreLong >= 3 ? "A+" : scoreLong == 2 ? "B" : "C"
+    label.new(bar_index, low,
+         "BUY " + gradeTxt + "\n@ " + str.tostring(close, format.mintick) +
+         "\nT1 " + str.tostring(t1, format.mintick) + f_pctTxt(histT1) +
+         "\nT2 " + str.tostring(t2, format.mintick) + f_pctTxt(histT2) +
+         "\n⏱ hold " + f_dur(medHold),
+         style = label.style_label_up, color = colBull, textcolor = color.white, size = size.small)
+    t1Line := line.new(bar_index, t1, bar_index + 1, t1, color = colT1, style = line.style_dashed, width = 1)
+    t2Line := line.new(bar_index, t2, bar_index + 1, t2, color = colT2, style = line.style_dotted, width = 1)
+    t1Lab := label.new(bar_index + 1, t1, "T1 " + str.tostring(t1, format.mintick), style = label.style_label_left, color = color.new(colT1, 85), textcolor = colT1, size = size.small)
+    t2Lab := label.new(bar_index + 1, t2, "T2 " + str.tostring(t2, format.mintick), style = label.style_label_left, color = color.new(colT2, 85), textcolor = colT2, size = size.small)
+
+if shortEntry
+    dir := -1
+    entryPrice := close
+    entryBar := bar_index
+    t1 := close - t1Mult * atrVal
+    t2 := close - t2Mult * atrVal
+    t1Hit := false
+    t2Hit := false
+    t1HitBar := na
+    histT1 = f_rate(sT1)
+    histT2 = f_rate(sT2)
+    medHold = array.size(sHold) >= 5 ? array.median(sHold) : na
+    gradeTxt = scoreShort >= 3 ? "A+" : scoreShort == 2 ? "B" : "C"
+    label.new(bar_index, high,
+         "SELL " + gradeTxt + "\n@ " + str.tostring(close, format.mintick) +
+         "\nT1 " + str.tostring(t1, format.mintick) + f_pctTxt(histT1) +
+         "\nT2 " + str.tostring(t2, format.mintick) + f_pctTxt(histT2) +
+         "\n⏱ hold " + f_dur(medHold),
+         style = label.style_label_down, color = colBear, textcolor = color.white, size = size.small)
+    t1Line := line.new(bar_index, t1, bar_index + 1, t1, color = colT1, style = line.style_dashed, width = 1)
+    t2Line := line.new(bar_index, t2, bar_index + 1, t2, color = colT2, style = line.style_dotted, width = 1)
+    t1Lab := label.new(bar_index + 1, t1, "T1 " + str.tostring(t1, format.mintick), style = label.style_label_left, color = color.new(colT1, 85), textcolor = colT1, size = size.small)
+    t2Lab := label.new(bar_index + 1, t2, "T2 " + str.tostring(t2, format.mintick), style = label.style_label_left, color = color.new(colT2, 85), textcolor = colT2, size = size.small)
+
+// ── 4. Keep target lines/labels attached to the open signal ─────────────────
+if dir != 0 and not na(t1Line)
+    line.set_x2(t1Line, bar_index + 1)
+    line.set_x2(t2Line, bar_index + 1)
+    label.set_x(t1Lab, bar_index + 1)
+    label.set_x(t2Lab, bar_index + 1)
+
+// ── 5. Plots ─────────────────────────────────────────────────────────────────
+plot(showTrail and bar_index > atrLen ? trail : na, "ATR trailing stop",
+     color = posState == 1 ? colBull : colBear, linewidth = 2)
+pF = plot(showEmaRibbon ? emaF : na, "EMA fast", color = color.new(colBull, 60))
+pS = plot(showEmaRibbon ? emaS : na, "EMA slow", color = color.new(colBear, 60))
+fill(pF, pS, color = emaF > emaS ? color.new(colBull, 88) : color.new(colBear, 88), title = "EMA ribbon")
+plotshape(longExit and not shortEntry, "Exit long", shape.xcross, location.abovebar, colFlat, size = size.tiny)
+plotshape(shortExit and not longEntry, "Exit short", shape.xcross, location.belowbar, colFlat, size = size.tiny)
+
+// ── 6. Dashboard ─────────────────────────────────────────────────────────────
+tPos = tablePosInp == "top_right" ? position.top_right :
+     tablePosInp == "top_left" ? position.top_left :
+     tablePosInp == "bottom_right" ? position.bottom_right : position.bottom_left
+var table tbl = table.new(tPos, 2, 11, border_width = 1, border_color = color.new(color.gray, 70),
+     frame_width = 1, frame_color = color.new(color.gray, 50), bgcolor = color.new(color.black, 25))
+
+f_cell(int row, string k, string v, color vCol) =>
+    table.cell(tbl, 0, row, k, text_color = color.new(color.white, 30), text_size = size.small, text_halign = text.align_left)
+    table.cell(tbl, 1, row, v, text_color = vCol, text_size = size.small, text_halign = text.align_right)
+
+if barstate.islast and showTable
+    isLong  = dir == 1
+    holdArr = isLong ? lHold : sHold
+    t1Arr   = isLong ? lT1 : sT1
+    t2Arr   = isLong ? lT2 : sT2
+    toT1Arr = isLong ? lToT1 : sToT1
+    medHold = array.size(holdArr) >= 5 ? array.median(holdArr) : na
+    medToT1 = array.size(toT1Arr) >= 5 ? array.median(toT1Arr) : na
+    age     = dir != 0 ? bar_index - entryBar : na
+    remain  = not na(medHold) and not na(age) ? math.max(medHold - age, 0) : na
+    pnl     = dir != 0 ? (close / entryPrice - 1) * 100 * dir : na
+    nSig    = array.size(lHold) + array.size(sHold)
+
+    table.cell(tbl, 0, 0, "IREN SIGNAL PRO", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(tbl, 1, 0, timeframe.period + (timeframe.isintraday ? "m" : ""), text_color = color.new(color.white, 40), text_size = size.small, text_halign = text.align_right)
+
+    f_cell(1, "Signal", dir == 1 ? "LONG ▲" : dir == -1 ? "SHORT ▼" : "FLAT — wait", dir == 1 ? colBull : dir == -1 ? colBear : colFlat)
+    f_cell(2, "Entry", dir != 0 ? str.tostring(entryPrice, format.mintick) : "—", color.white)
+    f_cell(3, "Open P&L", not na(pnl) ? str.format("{0,number,#.##}%", pnl) : "—", not na(pnl) and pnl >= 0 ? colBull : colBear)
+    f_cell(4, "T1 (high-prob)", dir != 0 ? str.tostring(t1, format.mintick) + (t1Hit ? "  ✓" : "") + (na(f_rate(t1Arr)) ? "" : str.format("  ({0,number,#}%)", f_rate(t1Arr))) : "—", colT1)
+    f_cell(5, "T2 (stretch)", dir != 0 ? str.tostring(t2, format.mintick) + (t2Hit ? "  ✓" : "") + (na(f_rate(t2Arr)) ? "" : str.format("  ({0,number,#}%)", f_rate(t2Arr))) : "—", colT2)
+    f_cell(6, "Trailing stop", str.tostring(trail, format.mintick), posState == 1 ? colBull : colBear)
+    f_cell(7, "Typical hold", f_dur(medHold), color.white)
+    f_cell(8, "Time to T1", f_dur(medToT1), color.white)
+    f_cell(9, "Est. remaining", dir != 0 ? f_dur(remain) : "—", color.white)
+    f_cell(10, "Sample", str.tostring(nSig) + " signals", color.new(color.white, 40))
+
+// ── 7. Alerts ────────────────────────────────────────────────────────────────
+alertcondition(longEntry,  "BUY signal",  "IREN Signal Pro: BUY — targets & hold time on chart")
+alertcondition(shortEntry, "SELL signal", "IREN Signal Pro: SELL — targets & hold time on chart")
+alertcondition(t1HitNow,   "T1 reached",  "IREN Signal Pro: high-probability target T1 reached — consider taking partial profit")
+alertcondition(t2HitNow,   "T2 reached",  "IREN Signal Pro: stretch target T2 reached — consider closing")
+alertcondition(longExit or shortExit, "Signal exit", "IREN Signal Pro: trailing stop flipped — signal closed")
