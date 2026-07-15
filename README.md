@@ -3,9 +3,10 @@
 A Pine Script v5 indicator built for **NASDAQ:IREN** (works on any symbol) that gives:
 
 - **BUY / SELL signals** — an ATR trailing-stop engine (UT-Bot style) confirmed by trend (EMA 9/21), momentum (RSI 14) and volume.
-- **Two targets on every signal**, sized by IREN's live volatility (ATR):
-  - **T1 — high-probability target** (default 1.0 × ATR)
-  - **T2 — stretch target** (default 2.2 × ATR)
+- **Shaded reward/risk zones on every signal**, sized by IREN's live volatility (ATR):
+  - **Green zone (entry → T1)** — high-probability target (default 1.0 × ATR)
+  - **Light cyan zone (T1 → T2)** — stretch target (default 2.2 × ATR)
+  - **Red zone (entry → stop)** — your risk; it shrinks as the trailing stop tightens and turns green once the stop moves past entry (risk-free trade)
 - **Expected holding time** — how long the signal is likely to stay active, based on the *median* duration of all past signals on the chart.
 - **Self-measured probabilities** — the indicator tracks every historical signal and shows the **real hit rate** of T1 and T2 on IREN (e.g. "T1 · hit 82%"), so probabilities are measured, not guessed.
 - **Live dashboard** — active signal, age, open P&L, targets with hit rates, trailing stop, typical hold, time-to-T1, estimated remaining hold, and sample size.
