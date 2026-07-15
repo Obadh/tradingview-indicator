@@ -12,6 +12,9 @@
 //       light zone  = T1 → T2, the stretch target             (2.2 × ATR)
 //       red zone    = entry → trailing stop (risk); it shrinks as the stop
 //                     tightens and turns green once the trade is risk-free.
+//   • Adaptive end goals: targets are re-evaluated every bar from the live
+//     momentum strength (RSI, EMA trend, volume). Strong readings extend the
+//     targets; fading readings pull them in. A target locks once hit.
 //   • Self-measuring statistics: the script tracks every past signal on the
 //     chart and reports the REAL historical hit rate of T1 and T2 and the
 //     median holding time, so "how likely" and "how long" are measured on
@@ -51,6 +54,10 @@ volMult    = input.float(1.0,"Volume must exceed × average", step = 0.1, group 
 grpTgt = "Targets"
 t1Mult = input.float(1.0, "T1 — high-probability target (× ATR)", step = 0.1, group = grpTgt)
 t2Mult = input.float(2.2, "T2 — stretch target (× ATR)",          step = 0.1, group = grpTgt)
+adaptTargets = input.bool(true, "Adaptive targets (follow live momentum)", group = grpTgt,
+     tooltip = "Targets are re-evaluated every bar from the current momentum strength (RSI, EMA trend, volume). Strong readings extend the targets up to ~1.3–1.5× their base size; fading readings pull them in to ~0.6–0.7×. A target locks the moment it is hit.")
+adaptSpeed = input.float(0.25, "Adaptation speed", minval = 0.05, maxval = 1, step = 0.05, group = grpTgt,
+     tooltip = "How fast targets move toward their new level each bar. 0.25 = smooth, 1 = instant.")
 
 grpUi = "Display"
 showTable     = input.bool(true, "Show stats dashboard", group = grpUi)
@@ -106,6 +113,18 @@ scoreShort = (emaF < emaS ? 1 : 0) + (rsiVal < 50 ? 1 : 0) + (volOk ? 1 : 0)
 longOk     = scoreLong  >= minScore
 shortOk    = scoreShort >= minScore
 barOk      = not confirmBarClose or barstate.isconfirmed
+
+// Momentum strength 0..1 — drives the adaptive targets
+f_clamp01(float x) =>
+    math.max(0.0, math.min(1.0, x))
+volRatio  = na(volAvg) or volAvg == 0 ? 1.0 : volume / volAvg
+compVol   = f_clamp01((volRatio - 0.8) / 1.2)
+strLong   = (f_clamp01((rsiVal - 50) / 25) + f_clamp01((emaF - emaS) / atrVal) + compVol) / 3
+strShort  = (f_clamp01((50 - rsiVal) / 25) + f_clamp01((emaS - emaF) / atrVal) + compVol) / 3
+
+// target size factors: weak momentum ≈ 0.7×/0.6× base, max momentum ≈ 1.3×/1.5×
+f_t1Factor(float s) => 0.7 + 0.6 * s
+f_t2Factor(float s) => 0.6 + 0.9 * s
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 // Historical hit rate of an outcome array (needs ≥5 samples to be meaningful)
@@ -180,6 +199,20 @@ bool shortExit  = false
 bool t1HitNow   = false
 bool t2HitNow   = false
 
+// ── 0. Adapt the open targets to the current readings ───────────────────────
+// Strong momentum pushes the end goal further out; fading momentum pulls it
+// closer. A target stops moving the moment it is hit.
+if adaptTargets and dir != 0 and bar_index > entryBar
+    s = dir == 1 ? strLong : strShort
+    if not t1Hit
+        newT1 = entryPrice + dir * t1Mult * f_t1Factor(s) * atrVal
+        t1 := t1 + (newT1 - t1) * adaptSpeed
+    if not t2Hit
+        newT2 = entryPrice + dir * t2Mult * f_t2Factor(s) * atrVal
+        t2 := t2 + (newT2 - t2) * adaptSpeed
+        minT2 = t1 + dir * 0.3 * atrVal
+        t2 := dir == 1 ? math.max(t2, minT2) : math.min(t2, minT2)
+
 // ── 1. Track target hits on the open signal ─────────────────────────────────
 if dir == 1 and bar_index > entryBar
     if not t1Hit and high >= t1
@@ -197,13 +230,6 @@ if dir == -1 and bar_index > entryBar
     if not t2Hit and low <= t2
         t2Hit := true
         t2HitNow := true
-if t1HitNow
-    box.set_bgcolor(boxT1, bgT1Hit)
-    box.set_text(boxT1, "T1 ✓ " + str.tostring(t1, format.mintick))
-if t2HitNow
-    box.set_bgcolor(boxT2, bgT2Hit)
-    box.set_text(boxT2, "T2 ✓ " + str.tostring(t2, format.mintick))
-
 // ── 2. Exits (a trailing-stop flip always closes the open signal) ───────────
 if dir == 1 and baseSell and barOk
     f_pushCapped(lHold, bar_index - entryBar)
@@ -234,8 +260,8 @@ if longEntry
     dir := 1
     entryPrice := close
     entryBar := bar_index
-    t1 := close + t1Mult * atrVal
-    t2 := close + t2Mult * atrVal
+    t1 := close + t1Mult * (adaptTargets ? f_t1Factor(strLong) : 1.0) * atrVal
+    t2 := close + t2Mult * (adaptTargets ? f_t2Factor(strLong) : 1.0) * atrVal
     t1Hit := false
     t2Hit := false
     t1HitBar := na
@@ -257,8 +283,8 @@ if shortEntry
     dir := -1
     entryPrice := close
     entryBar := bar_index
-    t1 := close - t1Mult * atrVal
-    t2 := close - t2Mult * atrVal
+    t1 := close - t1Mult * (adaptTargets ? f_t1Factor(strShort) : 1.0) * atrVal
+    t2 := close - t2Mult * (adaptTargets ? f_t2Factor(strShort) : 1.0) * atrVal
     t1Hit := false
     t2Hit := false
     t1HitBar := na
@@ -281,6 +307,15 @@ if dir != 0 and not na(boxT1)
     box.set_right(boxT1, bar_index + 1)
     box.set_right(boxT2, bar_index + 1)
     box.set_right(boxRisk, bar_index + 1)
+    // target zones follow the adaptive targets and lock/darken once hit
+    box.set_top(boxT1, math.max(entryPrice, t1))
+    box.set_bottom(boxT1, math.min(entryPrice, t1))
+    box.set_text(boxT1, (t1Hit ? "T1 ✓ " : "T1 ") + str.tostring(t1, format.mintick))
+    box.set_bgcolor(boxT1, t1Hit ? bgT1Hit : bgT1)
+    box.set_top(boxT2, math.max(t1, t2))
+    box.set_bottom(boxT2, math.min(t1, t2))
+    box.set_text(boxT2, (t2Hit ? "T2 ✓ " : "T2 ") + str.tostring(t2, format.mintick))
+    box.set_bgcolor(boxT2, t2Hit ? bgT2Hit : bgT2)
     // the risk zone follows the trailing stop and flips green once risk-free
     box.set_top(boxRisk, math.max(entryPrice, trail))
     box.set_bottom(boxRisk, math.min(entryPrice, trail))
@@ -303,7 +338,7 @@ plotshape(shortExit and not longEntry, "Exit short", shape.xcross, location.belo
 tPos = tablePosInp == "top_right" ? position.top_right :
      tablePosInp == "top_left" ? position.top_left :
      tablePosInp == "bottom_right" ? position.bottom_right : position.bottom_left
-var table tbl = table.new(tPos, 2, 11, border_width = 1, border_color = color.new(color.gray, 70),
+var table tbl = table.new(tPos, 2, 12, border_width = 1, border_color = color.new(color.gray, 70),
      frame_width = 1, frame_color = color.new(color.gray, 50), bgcolor = color.new(color.black, 25))
 
 f_cell(int row, string k, string v, color vCol) =>
@@ -335,7 +370,10 @@ if barstate.islast and showTable
     f_cell(7, "Typical hold", f_dur(medHold), color.white)
     f_cell(8, "Time to T1", f_dur(medToT1), color.white)
     f_cell(9, "Est. remaining", dir != 0 ? f_dur(remain) : "—", color.white)
-    f_cell(10, "Sample", str.tostring(nSig) + " signals", color.new(color.white, 40))
+    sAct = dir == -1 or (dir == 0 and posState == -1) ? strShort : strLong
+    momTxt = str.format("{0,number,#}%", sAct * 100) + (not adaptTargets ? "" : sAct > 0.65 ? " ▲ extending" : sAct < 0.35 ? " ▼ pulling in" : " → steady")
+    f_cell(10, "Momentum", momTxt, sAct > 0.65 ? colBull : sAct < 0.35 ? colBear : color.white)
+    f_cell(11, "Sample", str.tostring(nSig) + " signals", color.new(color.white, 40))
 
 // ── 7. Alerts ────────────────────────────────────────────────────────────────
 alertcondition(longEntry,  "BUY signal",  "IREN Signal Pro: BUY — targets & hold time on chart")

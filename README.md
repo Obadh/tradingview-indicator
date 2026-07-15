@@ -7,6 +7,7 @@ A Pine Script v5 indicator built for **NASDAQ:IREN** (works on any symbol) that 
   - **Green zone (entry → T1)** — high-probability target (default 1.0 × ATR)
   - **Light cyan zone (T1 → T2)** — stretch target (default 2.2 × ATR)
   - **Red zone (entry → stop)** — your risk; it shrinks as the trailing stop tightens and turns green once the stop moves past entry (risk-free trade)
+- **Adaptive end goals** — targets are re-evaluated on every bar from a live momentum score (RSI distance from 50, EMA 9/21 spread vs ATR, volume vs average). Strong readings stretch T1/T2 up to ~1.3–1.5× their base size; fading readings pull them in to ~0.6–0.7×. Once a target is hit it locks and stops moving. The dashboard's **Momentum** row shows the current score and whether the goals are extending (▲), steady (→), or pulling in (▼). Turn this off with the "Adaptive targets" input if you prefer fixed targets.
 - **Expected holding time** — how long the signal is likely to stay active, based on the *median* duration of all past signals on the chart.
 - **Self-measured probabilities** — the indicator tracks every historical signal and shows the **real hit rate** of T1 and T2 on IREN (e.g. "T1 · hit 82%"), so probabilities are measured, not guessed.
 - **Live dashboard** — active signal, age, open P&L, targets with hit rates, trailing stop, typical hold, time-to-T1, estimated remaining hold, and sample size.
@@ -60,6 +61,7 @@ Keep **"Confirm signals on bar close"** enabled — it prevents repainting (sign
 
 - **Signal engine:** price crossing an ATR trailing stop (`ATR(10) × 1.8`) flips the bias; entries require the confirmation score (EMA 9>21, RSI>50, volume above average) to pass.
 - **Targets:** `entry ± multiplier × ATR` — they scale with IREN's current volatility instead of using fixed dollar amounts.
+- **Adaptive targets:** momentum strength `s ∈ [0,1]` is the average of three normalized components — RSI vs 50, EMA spread vs ATR, volume vs its average. Each bar the target is pulled toward `entry ± mult × factor(s) × ATR` (T1 factor `0.7 + 0.6s`, T2 factor `0.6 + 0.9s`) at the configured adaptation speed, and T2 always stays at least 0.3 × ATR beyond T1. Hit targets lock immediately.
 - **Hit rates & hold time:** every closed signal is recorded (up to the last 300 per direction). Hit rate = share of past signals that reached the target; hold time = median bars held, converted to hours/days for your chart timeframe. Statistics appear once ≥5 signals have completed.
 - **Estimated remaining hold** = median hold − current signal age (floored at 0).
 
