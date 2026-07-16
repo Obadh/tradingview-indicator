@@ -67,6 +67,14 @@ showEmaRibbon = input.bool(true, "Show EMA 9/21 ribbon", group = grpUi)
 showTrail     = input.bool(false, "Show ATR trailing stop line", group = grpUi,
      tooltip = "The stop is already visible as the bottom edge of the red risk zone; enable this to also draw it as a line across the whole chart.")
 
+grpAl = "Notifications"
+alertsOn   = input.bool(true, "Send dynamic notifications", group = grpAl,
+     tooltip = "Create ONE alert on this indicator with condition 'Any alert() function call' and every event (BUY, SELL, T1/T2 hit, exit, profit-protection warning) is pushed with live prices. See README.")
+protPct    = input.float(50, "Warn after giving back % of peak profit", minval = 10, maxval = 90, step = 5, group = grpAl,
+     tooltip = "Profit-protection warning: fires once per trade when the open profit has retraced this much from its peak.")
+protMinAtr = input.float(0.8, "…only if peak profit was ≥ × ATR", minval = 0.1, step = 0.1, group = grpAl,
+     tooltip = "Avoids noise warnings on trades that never really moved.")
+
 // ── Colors ───────────────────────────────────────────────────────────────────
 colBull  = color.new(#089981, 0)
 colBear  = color.new(#f23645, 0)
@@ -159,6 +167,8 @@ var int   t1HitBar   = na
 var box   boxT1      = na       // entry → T1 zone
 var box   boxT2      = na       // T1 → T2 zone
 var box   boxRisk    = na       // entry → trailing stop zone
+var float extremeSinceEntry = na  // best price reached since entry
+var bool  protWarned = false      // profit-protection warning already sent
 
 // Historical statistics (long / short kept separate)
 var lHold  = array.new_float()  // bars held per closed long signal
@@ -192,12 +202,14 @@ f_zones(float eP, float tp1, float tp2, float stp) =>
     [b1, b2, b3]
 
 // Per-bar event flags (for plots & alerts)
-bool longEntry  = false
-bool shortEntry = false
-bool longExit   = false
-bool shortExit  = false
-bool t1HitNow   = false
-bool t2HitNow   = false
+bool longEntry   = false
+bool shortEntry  = false
+bool longExit    = false
+bool shortExit   = false
+bool t1HitNow    = false
+bool t2HitNow    = false
+bool protWarnNow = false
+float exitPnl    = na
 
 // ── 0. Adapt the open targets to the current readings ───────────────────────
 // Strong momentum pushes the end goal further out; fading momentum pulls it
@@ -238,6 +250,7 @@ if dir == 1 and baseSell and barOk
     if t1Hit
         f_pushCapped(lToT1, t1HitBar - entryBar)
     longExit := true
+    exitPnl := (close / entryPrice - 1) * 100
     dir := 0
 if dir == -1 and baseBuy and barOk
     f_pushCapped(sHold, bar_index - entryBar)
@@ -246,6 +259,7 @@ if dir == -1 and baseBuy and barOk
     if t1Hit
         f_pushCapped(sToT1, t1HitBar - entryBar)
     shortExit := true
+    exitPnl := (entryPrice - close) / entryPrice * 100
     dir := 0
 if longExit or shortExit
     box.set_right(boxT1, bar_index)
@@ -265,6 +279,8 @@ if longEntry
     t1Hit := false
     t2Hit := false
     t1HitBar := na
+    extremeSinceEntry := close
+    protWarned := false
     medHold = array.size(lHold) >= 5 ? array.median(lHold) : na
     gradeTxt = scoreLong >= 3 ? "A+" : scoreLong == 2 ? "B" : "C"
     label.new(bar_index, low, "BUY " + gradeTxt + "\n⏱ " + f_dur(medHold),
@@ -288,6 +304,8 @@ if shortEntry
     t1Hit := false
     t2Hit := false
     t1HitBar := na
+    extremeSinceEntry := close
+    protWarned := false
     medHold = array.size(sHold) >= 5 ? array.median(sHold) : na
     gradeTxt = scoreShort >= 3 ? "A+" : scoreShort == 2 ? "B" : "C"
     label.new(bar_index, high, "SELL " + gradeTxt + "\n⏱ " + f_dur(medHold),
@@ -324,6 +342,22 @@ if dir != 0 and not na(boxT1)
     box.set_border_color(boxRisk, riskFree ? brSafe : brRisk)
     box.set_text_color(boxRisk, riskFree ? colBull : colBear)
     box.set_text(boxRisk, (riskFree ? "stop ✓ " : "stop ") + str.tostring(trail, format.mintick))
+
+// ── 4b. Profit-protection warning ────────────────────────────────────────────
+// Fires once per trade when the open profit gives back protPct% of its peak —
+// the "it was +5% and now it's negative" scenario.
+if dir != 0
+    extremeSinceEntry := dir == 1 ? math.max(nz(extremeSinceEntry, entryPrice), high) :
+         math.min(nz(extremeSinceEntry, entryPrice), low)
+    peakProfit = dir == 1 ? extremeSinceEntry - entryPrice : entryPrice - extremeSinceEntry
+    givenBack  = dir == 1 ? extremeSinceEntry - close : close - extremeSinceEntry
+    if not protWarned and bar_index > entryBar and peakProfit >= protMinAtr * atrVal and givenBack >= peakProfit * protPct / 100 and barOk
+        protWarned := true
+        protWarnNow := true
+        label.new(bar_index, dir == 1 ? high : low, "⚠ protect",
+             style = dir == 1 ? label.style_label_down : label.style_label_up,
+             color = color.new(color.orange, 15), textcolor = color.white, size = size.small,
+             tooltip = "Position has given back " + str.tostring(protPct, "#") + "% of its peak profit — consider taking money off the table.")
 
 // ── 5. Plots ─────────────────────────────────────────────────────────────────
 plot(showTrail and bar_index > atrLen ? trail : na, "ATR trailing stop",
@@ -375,9 +409,39 @@ if barstate.islast and showTable
     f_cell(10, "Momentum", momTxt, sAct > 0.65 ? colBull : sAct < 0.35 ? colBear : color.white)
     f_cell(11, "Sample", str.tostring(nSig) + " signals", color.new(color.white, 40))
 
-// ── 7. Alerts ────────────────────────────────────────────────────────────────
+// ── 7. Alerts / notifications ────────────────────────────────────────────────
+// Dynamic notifications with live prices. Create ONE alert on this indicator
+// with condition "Any alert() function call" and every event below is pushed
+// to your phone/e-mail — see README for the 60-second setup.
+if alertsOn
+    tick = syminfo.ticker
+    if longEntry
+        alert("🟢 BUY " + tick + " @ " + str.tostring(close, format.mintick) +
+             " | T1 " + str.tostring(t1, format.mintick) + " · T2 " + str.tostring(t2, format.mintick) +
+             " | stop " + str.tostring(trail, format.mintick), alert.freq_once_per_bar)
+    if shortEntry
+        alert("🔴 SELL " + tick + " @ " + str.tostring(close, format.mintick) +
+             " | T1 " + str.tostring(t1, format.mintick) + " · T2 " + str.tostring(t2, format.mintick) +
+             " | stop " + str.tostring(trail, format.mintick), alert.freq_once_per_bar)
+    if t1HitNow
+        alert("🎯 " + tick + ": T1 reached @ " + str.tostring(t1, format.mintick) +
+             " — consider taking partial profit", alert.freq_once_per_bar)
+    if t2HitNow
+        alert("🎯🎯 " + tick + ": stretch target T2 reached @ " + str.tostring(t2, format.mintick) +
+             " — consider closing the position", alert.freq_once_per_bar)
+    if protWarnNow
+        peakPct = dir == 1 ? (extremeSinceEntry / entryPrice - 1) * 100 : (entryPrice - extremeSinceEntry) / entryPrice * 100
+        nowPct  = dir == 1 ? (close / entryPrice - 1) * 100 : (entryPrice - close) / entryPrice * 100
+        alert("⚠️ " + tick + ": giving back gains — peaked +" + str.format("{0,number,#.#}", peakPct) +
+             "%, now " + str.format("{0,number,#.#}", nowPct) + "%. Consider protecting profit.", alert.freq_once_per_bar)
+    if longExit or shortExit
+        alert("✖ " + tick + ": " + (longExit ? "LONG" : "SHORT") + " signal closed @ " + str.tostring(close, format.mintick) +
+             " (" + (exitPnl >= 0 ? "+" : "") + str.format("{0,number,#.##}", exitPnl) + "%) — trailing stop flipped", alert.freq_once_per_bar)
+
+// Static conditions, if you prefer separate alerts per event type
 alertcondition(longEntry,  "BUY signal",  "IREN Signal Pro: BUY — targets & hold time on chart")
 alertcondition(shortEntry, "SELL signal", "IREN Signal Pro: SELL — targets & hold time on chart")
 alertcondition(t1HitNow,   "T1 reached",  "IREN Signal Pro: high-probability target T1 reached — consider taking partial profit")
 alertcondition(t2HitNow,   "T2 reached",  "IREN Signal Pro: stretch target T2 reached — consider closing")
+alertcondition(protWarnNow, "Profit-protection warning", "IREN Signal Pro: position giving back gains — consider protecting profit")
 alertcondition(longExit or shortExit, "Signal exit", "IREN Signal Pro: trailing stop flipped — signal closed")

@@ -51,11 +51,31 @@ IREN is a high-beta stock (Bitcoin mining / AI data centers) and moves 5–10% i
 
 Keep **"Confirm signals on bar close"** enabled — it prevents repainting (signals never appear and then vanish).
 
-## Setting up alerts
+## Getting notifications on your phone (recommended setup)
 
-1. Right-click the chart → **Add alert**.
-2. Condition: **IREN Signal Pro** → choose `BUY signal`, `SELL signal`, `T1 reached`, `T2 reached`, or `Signal exit`.
-3. Set *Options* to **Once per bar close** and pick your notification channel (app push, e-mail, webhook).
+One alert covers **everything** — BUY, SELL, T1/T2 reached, profit-protection warning, and exits — with live prices in each message:
+
+1. Install the **TradingView mobile app** and log in (needed for push notifications).
+2. Open the IREN chart with the indicator, right-click → **Add alert** (or press `Alt+A`).
+3. **Condition:** `IREN Signal Pro` → **`Any alert() function call`**.
+4. **Expiration:** Open-ended.
+5. **Notifications tab:** enable *Notify in app* (phone push) and optionally *Send email*.
+6. Click **Create**. Done — repeat once per symbol you want to watch (e.g. OPEN).
+
+You'll now get messages like:
+
+- `🟢 BUY IREN @ 39.15 | T1 40.05 · T2 41.15 | stop 38.60`
+- `🎯 IREN: T1 reached @ 40.05 — consider taking partial profit`
+- `⚠️ IREN: giving back gains — peaked +5.1%, now +2.3%. Consider protecting profit.`
+- `✖ IREN: LONG signal closed @ 38.92 (-0.6%) — trailing stop flipped`
+
+**The profit-protection warning** is your "never ride +5% back down to red" guard: it fires once per trade when the open profit has retraced a set share of its peak (default 50%, and only if the peak was at least 0.8 × ATR so tiny wiggles don't spam you). Tune both in the *Notifications* settings group.
+
+> Note: TradingView alerts run on their servers, so they work with your computer off — but the alert must stay active, and free plans limit how many active alerts you can have. Signals are confirmed on bar close, so on the 15m chart a notification arrives at the close of the 15-minute bar.
+
+### Prefer separate alerts per event?
+
+Classic `alertcondition` entries still exist: choose **IREN Signal Pro** → `BUY signal`, `SELL signal`, `T1 reached`, `T2 reached`, `Profit-protection warning`, or `Signal exit`, with *Once per bar close*.
 
 ## How the numbers are computed
 
