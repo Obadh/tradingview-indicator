@@ -6,6 +6,17 @@
 |---|---|
 | [`iren_signal_pro_v2.pine`](iren_signal_pro_v2.pine) | **Recommended.** Everything in V1 plus market-regime filters (ADX chop filter, higher-timeframe trend filter, signal cooldown), profitability stats (win rate, avg P&L per signal, profit factor) and a compact-labels mode. Fewer, better signals. |
 | [`iren_signal_pro.pine`](iren_signal_pro.pine) | V1 — the original engine. More signals, no regime filtering. Keep it if you want to compare. |
+| [`iren_signal_pro_strategy.pine`](iren_signal_pro_strategy.pine) | **Backtest version** — the same V2 engine as a TradingView *strategy*. Use the Strategy Tester tab to get a real equity curve, net profit, max drawdown and profit factor with commission/slippage included, and to tune the filters one at a time on months of data. Find a winning configuration here, then copy the settings into the indicator for live signals. |
+
+## Backtesting workflow (recommended before trusting any settings)
+
+1. Add `iren_signal_pro_strategy.pine` to the chart and open the **Strategy Tester** tab.
+2. Judge configurations on **Net profit**, **Max drawdown**, **Profit factor** and the equity-curve shape — with at least ~100 closed trades.
+3. Change **one input at a time**. The most valuable experiments on IREN, in order:
+   - **Volume multiplier 0 vs 1** and **Min confirmations 2 vs 3** — live stats suggest the volume-spike confirmation may select climax entries on this stock.
+   - **Max extension 1.5 / 2.0 / 0** — anti-chase strictness vs missing big extended moves.
+   - **Min ADX 15 / 20 / 25**, **profit-lock 1.0 / 1.5 × ATR**, **partial take at T1 on/off**.
+4. Copy the winning settings into `iren_signal_pro_v2.pine` for live signals and notifications.
 
 ## What's new in V2
 

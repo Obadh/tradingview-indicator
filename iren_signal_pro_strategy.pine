@@ -1,0 +1,242 @@
+//@version=5
+// ─────────────────────────────────────────────────────────────────────────────
+// IREN Signal Pro — STRATEGY (backtest version)
+//
+// The exact V2 signal engine, ported to a TradingView strategy so you can
+// evaluate it properly with the Strategy Tester: equity curve, net profit,
+// max drawdown, profit factor, per-trade list — over months of data, with
+// commission and slippage included.
+//
+// How to use:
+//   1. Pine Editor → paste → Add to chart. Open the "Strategy Tester" tab
+//      (bottom of TradingView).
+//   2. Judge on: Net profit, Max drawdown, Profit factor, and the equity
+//      curve shape. More than ~100 closed trades = meaningful.
+//   3. Tune ONE input at a time and watch the numbers move. Questions worth
+//      testing first on IREN:
+//        • Min confirmations 2 vs 3, and Volume multiplier 0 (off) vs 1 —
+//          the indicator's stats suggest the volume spike requirement may
+//          select climax entries on this stock.
+//        • Max extension 1.5 vs 2.0 vs 0 (off) — strictness of the
+//          anti-chase guard vs missing the big extended moves.
+//        • ADX minimum 15 / 20 / 25.
+//        • Profit-lock 1.0 vs 1.5 × ATR, partial take at T1 on/off.
+//   4. When a configuration wins here, copy those settings into the
+//      indicator (iren_signal_pro_v2.pine) for live signals & alerts.
+//
+// Defaults: 95% of equity per trade, 0.03% commission, 2 ticks slippage.
+// Signals fire on bar close (no repaint), same as the indicator.
+// ─────────────────────────────────────────────────────────────────────────────
+strategy("IREN Signal Pro — Strategy",
+     shorttitle = "IREN SP Strategy",
+     overlay = true,
+     initial_capital = 10000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 95,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.03,
+     slippage = 2,
+     process_orders_on_close = true,
+     max_labels_count = 500)
+
+// ── Inputs (identical to the V2 indicator) ──────────────────────────────────
+grpSig = "Signal engine"
+atrLen          = input.int(10,   "ATR length",                        minval = 1,   group = grpSig)
+atrMult         = input.float(1.8,"ATR sensitivity (trailing stop)",   minval = 0.1, step = 0.1, group = grpSig)
+minScore        = input.int(2,    "Min confirmations required (0–3)",  minval = 0, maxval = 3, group = grpSig)
+allowShorts     = input.bool(true,"Trade shorts",                      group = grpSig)
+
+grpReg = "Market regime filters"
+useAdx       = input.bool(true, "Chop filter — require trending market (ADX)", group = grpReg)
+adxLen       = input.int(14, "ADX length", minval = 1, group = grpReg)
+adxMin       = input.float(20, "Min ADX to allow entries", minval = 5, maxval = 50, step = 1, group = grpReg)
+useHtf       = input.bool(true, "Higher-timeframe trend filter", group = grpReg)
+htfTf        = input.timeframe("60", "Higher timeframe", group = grpReg)
+htfLen       = input.int(50, "HTF EMA length", minval = 1, group = grpReg)
+cooldownBars = input.int(3, "Cooldown — min bars between entries", minval = 0, group = grpReg)
+rrMin        = input.float(0, "Min reward:risk to T2 (0 = off)", minval = 0, step = 0.1, group = grpReg)
+
+grpQ = "Entry quality"
+maxExt = input.float(1.5, "Max extension from slow EMA (× ATR, 0 = off)", minval = 0, step = 0.1, group = grpQ)
+maxLag = input.int(6, "Max bars after trend flip to enter (0 = off)", minval = 0, group = grpQ)
+
+grpTime = "Timing filters"
+skipOpen = input.bool(true, "Skip first 15 min after the open (09:30–09:45 ET)", group = grpTime)
+rthOnly  = input.bool(false, "Entries only during regular hours (09:30–16:00 ET)", group = grpTime)
+
+grpFlt = "Confirmations"
+emaFastLen = input.int(9,    "Fast EMA",                     group = grpFlt)
+emaSlowLen = input.int(21,   "Slow EMA",                     group = grpFlt)
+rsiLen     = input.int(14,   "RSI length",                   group = grpFlt)
+volLen     = input.int(20,   "Volume average length",        group = grpFlt)
+volMult    = input.float(1.0,"Volume must exceed × average (0 = ignore volume)", minval = 0, step = 0.1, group = grpFlt)
+
+grpTgt = "Targets & exits"
+t1Mult = input.float(1.0, "T1 — high-probability target (× ATR)", step = 0.1, group = grpTgt)
+t2Mult = input.float(2.2, "T2 — stretch target (× ATR)",          step = 0.1, group = grpTgt)
+adaptTargets = input.bool(true, "Adaptive targets (follow live momentum)", group = grpTgt)
+adaptSpeed = input.float(0.25, "Adaptation speed", minval = 0.05, maxval = 1, step = 0.05, group = grpTgt)
+takeT1    = input.bool(true, "Take partial profit at T1", group = grpTgt)
+t1QtyPct  = input.int(50, "…partial size (% of position)", minval = 10, maxval = 90, step = 10, group = grpTgt)
+useLock   = input.bool(true, "Profit-lock exit after T2", group = grpTgt)
+lockTight = input.float(1.0, "…tightened stop distance (× ATR from peak)", minval = 0.2, step = 0.1, group = grpTgt)
+
+// ── Core series (identical to the V2 indicator) ─────────────────────────────
+atrVal  = ta.atr(atrLen)
+emaF    = ta.ema(close, emaFastLen)
+emaS    = ta.ema(close, emaSlowLen)
+rsiVal  = ta.rsi(close, rsiLen)
+volAvg  = ta.sma(volume, volLen)
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)
+htfEma  = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfLen), barmerge.gaps_off, barmerge.lookahead_off)
+
+nLoss = atrMult * atrVal
+var float trail = na
+trail := close > nz(trail[1]) and close[1] > nz(trail[1]) ? math.max(nz(trail[1]), close - nLoss) :
+     close < nz(trail[1]) and close[1] < nz(trail[1]) ? math.min(nz(trail[1]), close + nLoss) :
+     close > nz(trail[1]) ? close - nLoss : close + nLoss
+
+var int posState = 0
+posState := close > trail ? 1 : close < trail ? -1 : nz(posState[1])
+var int flipBar = na
+if posState != nz(posState[1])
+    flipBar := bar_index
+
+baseBuy  = ta.crossover(close, trail)
+baseSell = ta.crossunder(close, trail)
+
+volOk      = volMult == 0 or (not na(volAvg) and volume > volAvg * volMult)
+scoreLong  = (emaF > emaS ? 1 : 0) + (rsiVal > 50 ? 1 : 0) + (volOk ? 1 : 0)
+scoreShort = (emaF < emaS ? 1 : 0) + (rsiVal < 50 ? 1 : 0) + (volOk ? 1 : 0)
+longOk     = scoreLong  >= minScore
+shortOk    = scoreShort >= minScore
+barOk      = barstate.isconfirmed or barstate.ishistory
+
+trending      = not useAdx or adxVal >= adxMin
+regimeLongOk  = trending and (not useHtf or close > htfEma)
+regimeShortOk = trending and (not useHtf or close < htfEma)
+
+f_clamp01(float x) =>
+    math.max(0.0, math.min(1.0, x))
+volRatio  = na(volAvg) or volAvg == 0 ? 1.0 : volume / volAvg
+compVol   = f_clamp01((volRatio - 0.8) / 1.2)
+strLong   = (f_clamp01((rsiVal - 50) / 25) + f_clamp01((emaF - emaS) / atrVal) + compVol) / 3
+strShort  = (f_clamp01((50 - rsiVal) / 25) + f_clamp01((emaS - emaF) / atrVal) + compVol) / 3
+f_t1Factor(float s) => 0.7 + 0.6 * s
+f_t2Factor(float s) => 0.6 + 0.9 * s
+
+inRth       = not timeframe.isintraday or not na(time(timeframe.period, "0930-1600", "America/New_York"))
+inOpenRange = timeframe.isintraday and not na(time(timeframe.period, "0930-0945", "America/New_York"))
+timeOK      = (not rthOnly or inRth) and not (skipOpen and inOpenRange)
+
+t2CandL = close + t2Mult * (adaptTargets ? f_t2Factor(strLong) : 1.0) * atrVal
+t2CandS = close - t2Mult * (adaptTargets ? f_t2Factor(strShort) : 1.0) * atrVal
+rrLong  = close - trail > 0 ? (t2CandL - close) / (close - trail) : na
+rrShort = trail - close > 0 ? (close - t2CandS) / (trail - close) : na
+rrOkL   = rrMin == 0 or (not na(rrLong) and rrLong >= rrMin)
+rrOkS   = rrMin == 0 or (not na(rrShort) and rrShort >= rrMin)
+
+extOkL = maxExt == 0 or close - emaS <= maxExt * atrVal
+extOkS = maxExt == 0 or emaS - close <= maxExt * atrVal
+lagOk  = maxLag == 0 or (not na(flipBar) and bar_index - flipBar <= maxLag)
+
+// ── Trade state ──────────────────────────────────────────────────────────────
+var int   dir        = 0
+var float entryPrice = na
+var int   entryBar   = na
+var float t1         = na
+var float t2         = na
+var bool  t1Hit      = false
+var bool  t2Hit      = false
+var float extremeSinceEntry = na
+var int   lastEntryBar = na
+var int   lockExitDir  = 0
+
+// ── 0. Adapt the open targets ────────────────────────────────────────────────
+if adaptTargets and dir != 0 and bar_index > entryBar
+    s = dir == 1 ? strLong : strShort
+    if not t1Hit
+        newT1 = entryPrice + dir * t1Mult * f_t1Factor(s) * atrVal
+        t1 := t1 + (newT1 - t1) * adaptSpeed
+    if not t2Hit
+        newT2 = entryPrice + dir * t2Mult * f_t2Factor(s) * atrVal
+        t2 := t2 + (newT2 - t2) * adaptSpeed
+        minT2 = t1 + dir * 0.3 * atrVal
+        t2 := dir == 1 ? math.max(t2, minT2) : math.min(t2, minT2)
+
+// ── 1. Track best price and target hits ──────────────────────────────────────
+if dir != 0
+    extremeSinceEntry := dir == 1 ? math.max(nz(extremeSinceEntry, entryPrice), high) :
+         math.min(nz(extremeSinceEntry, entryPrice), low)
+if dir == 1 and bar_index > entryBar
+    if not t1Hit and high >= t1
+        t1Hit := true
+    if not t2Hit and high >= t2
+        t2Hit := true
+if dir == -1 and bar_index > entryBar
+    if not t1Hit and low <= t1
+        t1Hit := true
+    if not t2Hit and low <= t2
+        t2Hit := true
+
+// ── 2. Exits: trailing-stop flip, or profit-lock after T2 ───────────────────
+lockHitL = useLock and dir == 1 and t2Hit and bar_index > entryBar and close < extremeSinceEntry - lockTight * atrVal
+lockHitS = useLock and dir == -1 and t2Hit and bar_index > entryBar and close > extremeSinceEntry + lockTight * atrVal
+
+if dir == 1 and (baseSell or lockHitL) and barOk
+    strategy.close("Long", comment = lockHitL and not baseSell ? "lock" : "flip")
+    if lockHitL and not baseSell
+        lockExitDir := 1
+    dir := 0
+if dir == -1 and (baseBuy or lockHitS) and barOk
+    strategy.close("Short", comment = lockHitS and not baseBuy ? "lock" : "flip")
+    if lockHitS and not baseBuy
+        lockExitDir := -1
+    dir := 0
+
+// ── 3. Entries ───────────────────────────────────────────────────────────────
+if baseBuy and lockExitDir == 1
+    lockExitDir := 0
+if baseSell and lockExitDir == -1
+    lockExitDir := 0
+
+cooldownOk = na(lastEntryBar) or bar_index - lastEntryBar >= cooldownBars
+longEntry  = dir != 1 and posState == 1 and longOk and regimeLongOk and cooldownOk and timeOK and rrOkL and extOkL and lagOk and lockExitDir != 1 and barOk
+shortEntry = allowShorts and dir != -1 and posState == -1 and shortOk and regimeShortOk and cooldownOk and timeOK and rrOkS and extOkS and lagOk and lockExitDir != -1 and barOk
+
+if longEntry
+    dir := 1
+    entryPrice := close
+    entryBar := bar_index
+    lastEntryBar := bar_index
+    t1 := close + t1Mult * (adaptTargets ? f_t1Factor(strLong) : 1.0) * atrVal
+    t2 := close + t2Mult * (adaptTargets ? f_t2Factor(strLong) : 1.0) * atrVal
+    t1Hit := false
+    t2Hit := false
+    extremeSinceEntry := close
+    strategy.entry("Long", strategy.long)
+if shortEntry
+    dir := -1
+    entryPrice := close
+    entryBar := bar_index
+    lastEntryBar := bar_index
+    t1 := close - t1Mult * (adaptTargets ? f_t1Factor(strShort) : 1.0) * atrVal
+    t2 := close - t2Mult * (adaptTargets ? f_t2Factor(strShort) : 1.0) * atrVal
+    t1Hit := false
+    t2Hit := false
+    extremeSinceEntry := close
+    strategy.entry("Short", strategy.short)
+
+// ── 4. Partial profit at T1 (limit order, fills intrabar) ───────────────────
+if takeT1 and dir == 1 and not t1Hit
+    strategy.exit("T1", from_entry = "Long", qty_percent = t1QtyPct, limit = t1)
+if takeT1 and dir == -1 and not t1Hit
+    strategy.exit("T1", from_entry = "Short", qty_percent = t1QtyPct, limit = t1)
+
+// ── 5. Minimal visuals ───────────────────────────────────────────────────────
+colBull = color.new(#089981, 0)
+colBear = color.new(#f23645, 0)
+plot(bar_index > atrLen ? trail : na, "ATR trailing stop", color = posState == 1 ? colBull : colBear, linewidth = 2)
+plot(dir != 0 ? t1 : na, "T1", color = color.new(#26c281, 40), style = plot.style_linebr)
+plot(dir != 0 ? t2 : na, "T2", color = color.new(#00bcd4, 40), style = plot.style_linebr)
+bgcolor(useAdx and adxVal < adxMin ? color.new(color.gray, 92) : na, title = "Choppy market (no entries)")
