@@ -7,6 +7,11 @@
 | [`iren_signal_pro_v2.pine`](iren_signal_pro_v2.pine) | **Recommended.** Everything in V1 plus market-regime filters (ADX chop filter, higher-timeframe trend filter, signal cooldown), profitability stats (win rate, avg P&L per signal, profit factor) and a compact-labels mode. Fewer, better signals. |
 | [`iren_signal_pro.pine`](iren_signal_pro.pine) | V1 — the original engine. More signals, no regime filtering. Keep it if you want to compare. |
 | [`iren_signal_pro_strategy.pine`](iren_signal_pro_strategy.pine) | **Backtest version** — the same V2 engine as a TradingView *strategy*. Use the Strategy Tester tab to get a real equity curve, net profit, max drawdown and profit factor with commission/slippage included, and to tune the filters one at a time on months of data. Find a winning configuration here, then copy the settings into the indicator for live signals. |
+| [`iren_sniper_long_strategy.pine`](iren_sniper_long_strategy.pine) | **Sniper (longs-only) strategy** — the opposite philosophy: very few trades, pullback entries inside an established daily uptrend, fixed 1%-of-equity risk per trade, partial at +1.5R, chandelier trail. Built after backtests showed the flip engine had no edge (see verdict below). Test on the **daily** chart first. |
+
+## Backtest verdict (Signal Pro engine, measured Jul 2026)
+
+Tested with commission 0.03% + 2 ticks slippage: IREN 15m PF 0.70–0.76, SPY 15m PF 0.61, IREN 1h PF 0.87, IREN 1D PF 0.97 — **no configuration was profitable**, while IREN buy-and-hold made +256% over the same 18 months. Conclusions: (1) do not auto-trade the flip engine; use the V2 indicator as decision support (targets, hold times, regime shading, protect warnings); (2) profit factor rose with timeframe as friction shrank, converging to ~1.0 — a coin flip, not an edge; (3) shorts fighting IREN's uptrend did most damage. The Sniper strategy is the follow-up experiment: longs-only, trend-aligned, risk-based sizing — validate it in the Strategy Tester before acting on anything it signals.
 
 ## Backtesting workflow (recommended before trusting any settings)
 

@@ -1,0 +1,134 @@
+//@version=5
+// ─────────────────────────────────────────────────────────────────────────────
+// IREN Sniper Long — pullback-in-uptrend (backtest)
+//
+// The opposite philosophy of IREN Signal Pro: instead of many breakout-flip
+// trades, this waits for ONE high-quality long setup at a time:
+//
+//   REGIME   — only when the uptrend is established: price above the 200 EMA
+//              and the 50 EMA above the 200 EMA. No shorts, ever.
+//   SETUP    — a pullback: RSI dips below 45 or price touches the 21 EMA,
+//              while the regime stays intact. The setup stays "armed" for a
+//              limited number of bars.
+//   TRIGGER  — a reversal bar: close back above the 9 EMA, closing green and
+//              above the previous bar's high.
+//   RISK     — position sized so ONE trade risks a fixed % of equity (default
+//              1%). Stop below the recent swing low, as a real stop order.
+//   EXITS    — partial profit at +1.5R, remainder rides a chandelier trail
+//              (2.5 × ATR from the highest high); everything closes if price
+//              breaks the 50 EMA (trend over).
+//
+// Designed for the DAILY chart (also try 4h). Expect FEW trades — that is
+// the point. Judge it in the Strategy Tester before trusting a single signal.
+//
+// HONESTY NOTE: no configuration makes "every buy great". Some of these
+// entries WILL lose — the design goal is that losers cost ~1R and winners
+// average 2R+. If the tester shows profit factor below ~1.2 on IREN daily,
+// do not trade it mechanically either.
+// ─────────────────────────────────────────────────────────────────────────────
+strategy("IREN Sniper Long — Pullback in Uptrend",
+     shorttitle = "IREN Sniper",
+     overlay = true,
+     initial_capital = 10000,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.03,
+     slippage = 2,
+     process_orders_on_close = true)
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+grpT = "Trend regime"
+trendFastLen = input.int(50,  "Trend EMA fast",  minval = 1, group = grpT)
+trendSlowLen = input.int(200, "Trend EMA slow",  minval = 1, group = grpT)
+
+grpS = "Pullback setup"
+pullEmaLen = input.int(21, "Pullback EMA",  minval = 1, group = grpS)
+trigEmaLen = input.int(9,  "Trigger EMA",   minval = 1, group = grpS)
+rsiLen     = input.int(14, "RSI length",    minval = 1, group = grpS)
+rsiMax     = input.float(45, "RSI below = valid pullback", group = grpS)
+armBars    = input.int(10, "Setup stays valid for N bars", minval = 1, group = grpS)
+
+grpR = "Risk & exits"
+riskPct      = input.float(1.0, "Risk per trade (% of equity)", minval = 0.1, step = 0.25, group = grpR,
+     tooltip = "Position size is computed so a stop-out loses this % of equity. This — not the entry signal — is the biggest lever you control.")
+swingLen     = input.int(5, "Stop below lowest low of N bars", minval = 1, group = grpR)
+stopPadAtr   = input.float(0.5, "…extra ATR padding", minval = 0, step = 0.1, group = grpR)
+t1R          = input.float(1.5, "Partial profit at R multiple", minval = 0.5, step = 0.25, group = grpR)
+t1QtyPct     = input.int(50, "Partial size (% of position)", minval = 10, maxval = 90, step = 10, group = grpR)
+trailAtrMult = input.float(2.5, "Chandelier trail (× ATR from peak)", minval = 0.5, step = 0.1, group = grpR)
+cooldownBars = input.int(5, "Cooldown after an exit (bars)", minval = 0, group = grpR)
+
+// ── Series ───────────────────────────────────────────────────────────────────
+atrVal    = ta.atr(14)
+emaTrendF = ta.ema(close, trendFastLen)
+emaTrendS = ta.ema(close, trendSlowLen)
+emaPull   = ta.ema(close, pullEmaLen)
+emaTrig   = ta.ema(close, trigEmaLen)
+rsiVal    = ta.rsi(close, rsiLen)
+
+uptrend = close > emaTrendS and emaTrendF > emaTrendS
+
+// ── Setup arming: a pullback inside an intact uptrend ────────────────────────
+var int armedBar = na
+pullbackNow = uptrend and (rsiVal < rsiMax or low <= emaPull)
+if pullbackNow
+    armedBar := bar_index
+armed = not na(armedBar) and bar_index - armedBar <= armBars and uptrend
+
+// Trigger: reversal bar — green close, back above the trigger EMA,
+// taking out the previous bar's high
+trigger = armed and close > emaTrig and close > open and close > high[1]
+
+// ── Position management ──────────────────────────────────────────────────────
+var float stopLvl     = na
+var float entryRisk   = na    // risk per share at entry (1R)
+var float hh          = na    // highest high since entry
+var bool  t1Done      = false
+var int   lastExitBar = na
+
+inPos = strategy.position_size > 0
+
+// detect flat after having been in a position
+if not inPos and strategy.position_size[1] > 0
+    lastExitBar := bar_index
+    stopLvl := na
+    entryRisk := na
+    hh := na
+    t1Done := false
+
+cooldownOk = na(lastExitBar) or bar_index - lastExitBar >= cooldownBars
+
+// Entry: fixed-fractional risk sizing
+if not inPos and trigger and cooldownOk and barstate.isconfirmed
+    sl  = ta.lowest(low, swingLen) - stopPadAtr * atrVal
+    rps = close - sl
+    if rps > 0
+        qty = math.floor(strategy.equity * riskPct / 100 / rps)
+        if qty >= 1
+            strategy.entry("Long", strategy.long, qty = qty)
+            stopLvl := sl
+            entryRisk := rps
+            hh := high
+            armedBar := na  // consume the setup
+
+// While in a position: trail the stop, take partial at T1, exit on trend break
+if inPos
+    hh := math.max(nz(hh, high), high)
+    stopLvl := math.max(nz(stopLvl, hh - trailAtrMult * atrVal), hh - trailAtrMult * atrVal)
+    t1Lvl = strategy.position_avg_price + t1R * entryRisk
+    if not t1Done
+        strategy.exit("T1", from_entry = "Long", qty_percent = t1QtyPct, limit = t1Lvl)
+        if high >= t1Lvl
+            t1Done := true
+    strategy.exit("SL", from_entry = "Long", stop = stopLvl)
+    if close < emaTrendF and barstate.isconfirmed
+        strategy.close("Long", comment = "trend break")
+
+// ── Visuals ──────────────────────────────────────────────────────────────────
+colBull = color.new(#089981, 0)
+colBear = color.new(#f23645, 0)
+plot(emaTrendS, "EMA 200", color = color.new(#787b86, 30), linewidth = 2)
+plot(emaTrendF, "EMA 50",  color = color.new(#f2a900, 40))
+plot(emaPull,   "EMA 21",  color = color.new(#00bcd4, 60))
+plot(inPos ? stopLvl : na, "Stop", color = colBear, style = plot.style_linebr, linewidth = 2)
+bgcolor(uptrend ? na : color.new(color.gray, 94), title = "No-trade regime (not an uptrend)")
+plotshape(armed and not inPos, "Setup armed", shape.circle, location.belowbar, color.new(#00bcd4, 50), size = size.tiny)
