@@ -17,6 +17,13 @@
 
 Note: with the filters on, V2 fires noticeably fewer signals than V1 — that's the point. If it feels too quiet, lower "Min ADX" to 15 or disable the HTF filter.
 
+### V2.1 additions
+
+- **Profit-lock exit** — once T2 is reached, the exit stop tightens to 1.0 × ATR from the best price since entry (configurable). Big winners get banked instead of riding the wide trailing stop back down; the risk zone relabels to "lock" and the exit notification reads `🔒 … profit locked after T2`. After a lock exit, same-direction re-entry stays blocked until the trend flips and comes back, so it won't chase an extended move.
+- **Timing filters** — skip entries during the first 15 minutes after the open (on by default; the most whipsaw-prone window of the day), and optionally allow entries only during regular trading hours. Exits are never blocked.
+- **R:R quality filter** — optionally skip entries whose reward to T2 is below a minimum multiple of the stop distance ("Min reward:risk to T2"; 0 = off, try 0.8–1.0). Every entry tooltip now shows its R:R.
+- **A+ vs B performance split** — the dashboard shows average P&L per closed A+ signal vs B signal separately. If B signals consistently lose, set "Min confirmations" to 3 and trade only A+.
+
 A Pine Script v5 indicator built for **NASDAQ:IREN** (works on any symbol) that gives:
 
 - **BUY / SELL signals** — an ATR trailing-stop engine (UT-Bot style) confirmed by trend (EMA 9/21), momentum (RSI 14) and volume.

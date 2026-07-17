@@ -13,6 +13,15 @@
 //     profit factor in the dashboard, so you can judge whether the engine
 //     actually makes money on this symbol, not just how often it hits T1.
 //   • Compact label mode — tiny BUY/SELL tags, full details in the tooltip.
+//   • Profit-lock exit — once T2 is reached the stop tightens to a fraction
+//     of ATR from the peak, so big winners get banked instead of riding the
+//     wide trailing stop all the way back down.
+//   • Timing filters — optionally skip the first 15 min after the open
+//     and/or only enter during regular trading hours.
+//   • R:R quality filter — optionally skip entries whose potential reward
+//     to T2 is poor relative to the stop distance.
+//   • Grade performance split — average P&L of A+ vs B signals in the
+//     dashboard, so you can judge whether B signals earn their keep.
 //
 // V1 recap: ATR trailing-stop signal engine confirmed by EMA/RSI/volume,
 // shaded reward/risk zones, adaptive momentum-driven targets, self-measured
@@ -52,6 +61,14 @@ htfTf        = input.timeframe("60", "Higher timeframe", group = grpReg)
 htfLen       = input.int(50, "HTF EMA length", minval = 1, group = grpReg)
 cooldownBars = input.int(3, "Cooldown — min bars between entries", minval = 0, group = grpReg,
      tooltip = "Blocks a new entry for this many bars after the previous one, killing rapid-fire flip clusters.")
+rrMin        = input.float(0, "Min reward:risk to T2 (0 = off)", minval = 0, step = 0.1, group = grpReg,
+     tooltip = "Skip entries where (distance to T2) ÷ (distance to stop) is below this. Try 0.8–1.0 to only take trades with decent payoff potential. 0 disables the filter.")
+
+grpTime = "Timing filters (V2)"
+skipOpen = input.bool(true, "Skip first 15 min after the open (09:30–09:45 ET)", group = grpTime,
+     tooltip = "The opening range is the most whipsaw-prone window of the day. Entries are blocked there; exits still work. Intraday charts only.")
+rthOnly  = input.bool(false, "Entries only during regular hours (09:30–16:00 ET)", group = grpTime,
+     tooltip = "Blocks pre-market and after-hours entries, where spreads are wide and volume is thin. Intraday charts only.")
 
 grpFlt = "Confirmations"
 emaFastLen = input.int(9,    "Fast EMA",                     group = grpFlt)
@@ -67,6 +84,9 @@ adaptTargets = input.bool(true, "Adaptive targets (follow live momentum)", group
      tooltip = "Targets are re-evaluated every bar from the current momentum strength (RSI, EMA trend, volume). Strong readings extend the targets up to ~1.3–1.5× their base size; fading readings pull them in to ~0.6–0.7×. A target locks the moment it is hit.")
 adaptSpeed = input.float(0.25, "Adaptation speed", minval = 0.05, maxval = 1, step = 0.05, group = grpTgt,
      tooltip = "How fast targets move toward their new level each bar. 0.25 = smooth, 1 = instant.")
+useLock   = input.bool(true, "Profit-lock exit after T2", group = grpTgt,
+     tooltip = "Once T2 is reached, the exit stop tightens to the multiple below, measured from the best price since entry. Banks big winners instead of waiting for the wide trailing stop to flip.")
+lockTight = input.float(1.0, "…tightened stop distance (× ATR from peak)", minval = 0.2, step = 0.1, group = grpTgt)
 
 grpUi = "Display"
 showTable     = input.bool(true, "Show stats dashboard", group = grpUi)
@@ -150,6 +170,19 @@ strShort  = (f_clamp01((50 - rsiVal) / 25) + f_clamp01((emaS - emaF) / atrVal) +
 f_t1Factor(float s) => 0.7 + 0.6 * s
 f_t2Factor(float s) => 0.6 + 0.9 * s
 
+// Timing gate (V2): entries only, exits are never blocked
+inRth       = not timeframe.isintraday or not na(time(timeframe.period, "0930-1600", "America/New_York"))
+inOpenRange = timeframe.isintraday and not na(time(timeframe.period, "0930-0945", "America/New_York"))
+timeOK      = (not rthOnly or inRth) and not (skipOpen and inOpenRange)
+
+// Reward:risk to T2 of a would-be entry on this bar (V2)
+t2CandL = close + t2Mult * (adaptTargets ? f_t2Factor(strLong) : 1.0) * atrVal
+t2CandS = close - t2Mult * (adaptTargets ? f_t2Factor(strShort) : 1.0) * atrVal
+rrLong  = close - trail > 0 ? (t2CandL - close) / (close - trail) : na
+rrShort = trail - close > 0 ? (close - t2CandS) / (trail - close) : na
+rrOkL   = rrMin == 0 or (not na(rrLong) and rrLong >= rrMin)
+rrOkS   = rrMin == 0 or (not na(rrShort) and rrShort >= rrMin)
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 f_rate(arr) =>
     float r = na
@@ -184,6 +217,10 @@ var box   boxRisk    = na
 var float extremeSinceEntry = na
 var bool  protWarned = false
 var int   lastEntryBar = na
+var int   entryScore   = 0     // confirmation score of the open signal (V2)
+var float entryRR      = na    // reward:risk to T2 at entry (V2)
+var int   lockExitDir  = 0     // direction closed by a profit-lock exit; blocks
+                               // same-direction re-entry until the trend cycles
 
 // Historical statistics (long / short kept separate)
 var lHold  = array.new_float()
@@ -196,6 +233,8 @@ var sT1    = array.new_float()
 var sT2    = array.new_float()
 var sToT1  = array.new_float()
 var sPnl   = array.new_float()
+var pnlA   = array.new_float()  // P&L per closed A+ signal (V2)
+var pnlB   = array.new_float()  // P&L per closed B/C signal (V2)
 
 f_pushCapped(arr, val) =>
     array.push(arr, val)
@@ -226,6 +265,7 @@ bool shortExit   = false
 bool t1HitNow    = false
 bool t2HitNow    = false
 bool protWarnNow = false
+bool lockExitNow = false
 float exitPnl    = na
 
 // ── 0. Adapt the open targets to the current readings ───────────────────────
@@ -240,7 +280,10 @@ if adaptTargets and dir != 0 and bar_index > entryBar
         minT2 = t1 + dir * 0.3 * atrVal
         t2 := dir == 1 ? math.max(t2, minT2) : math.min(t2, minT2)
 
-// ── 1. Track target hits on the open signal ─────────────────────────────────
+// ── 1. Track the best price since entry and target hits ─────────────────────
+if dir != 0
+    extremeSinceEntry := dir == 1 ? math.max(nz(extremeSinceEntry, entryPrice), high) :
+         math.min(nz(extremeSinceEntry, entryPrice), low)
 if dir == 1 and bar_index > entryBar
     if not t1Hit and high >= t1
         t1Hit := true
@@ -258,8 +301,14 @@ if dir == -1 and bar_index > entryBar
         t2Hit := true
         t2HitNow := true
 
-// ── 2. Exits (a trailing-stop flip always closes the open signal) ───────────
-if dir == 1 and baseSell and barOk
+// ── 2. Exits ─────────────────────────────────────────────────────────────────
+// A trailing-stop flip always closes the open signal. In addition, after T2
+// is reached a tightened profit-lock stop (lockTight × ATR from the peak)
+// closes the trade early so big winners get banked (V2).
+lockHitL = useLock and dir == 1 and t2Hit and bar_index > entryBar and close < extremeSinceEntry - lockTight * atrVal
+lockHitS = useLock and dir == -1 and t2Hit and bar_index > entryBar and close > extremeSinceEntry + lockTight * atrVal
+
+if dir == 1 and (baseSell or lockHitL) and barOk
     f_pushCapped(lHold, bar_index - entryBar)
     f_pushCapped(lT1, t1Hit ? 1.0 : 0.0)
     f_pushCapped(lT2, t2Hit ? 1.0 : 0.0)
@@ -267,9 +316,13 @@ if dir == 1 and baseSell and barOk
         f_pushCapped(lToT1, t1HitBar - entryBar)
     exitPnl := (close / entryPrice - 1) * 100
     f_pushCapped(lPnl, exitPnl)
+    f_pushCapped(entryScore >= 3 ? pnlA : pnlB, exitPnl)
     longExit := true
+    if lockHitL and not baseSell
+        lockExitNow := true
+        lockExitDir := 1
     dir := 0
-if dir == -1 and baseBuy and barOk
+if dir == -1 and (baseBuy or lockHitS) and barOk
     f_pushCapped(sHold, bar_index - entryBar)
     f_pushCapped(sT1, t1Hit ? 1.0 : 0.0)
     f_pushCapped(sT2, t2Hit ? 1.0 : 0.0)
@@ -277,17 +330,28 @@ if dir == -1 and baseBuy and barOk
         f_pushCapped(sToT1, t1HitBar - entryBar)
     exitPnl := (entryPrice - close) / entryPrice * 100
     f_pushCapped(sPnl, exitPnl)
+    f_pushCapped(entryScore >= 3 ? pnlA : pnlB, exitPnl)
     shortExit := true
+    if lockHitS and not baseBuy
+        lockExitNow := true
+        lockExitDir := -1
     dir := 0
 if longExit or shortExit
     box.set_right(boxT1, bar_index)
     box.set_right(boxT2, bar_index)
     box.set_right(boxRisk, bar_index)
 
-// ── 3. Entries (V2: gated by regime filters and cooldown) ───────────────────
+// ── 3. Entries (V2: gated by regime, cooldown, timing, R:R, profit-lock) ────
+// After a profit-lock exit, same-direction re-entry stays blocked until the
+// trend flips and comes back — prevents chasing an extended move.
+if baseBuy and lockExitDir == 1
+    lockExitDir := 0
+if baseSell and lockExitDir == -1
+    lockExitDir := 0
+
 cooldownOk = na(lastEntryBar) or bar_index - lastEntryBar >= cooldownBars
-longEntry  := dir != 1 and posState == 1 and longOk and regimeLongOk and cooldownOk and barOk
-shortEntry := allowShorts and dir != -1 and posState == -1 and shortOk and regimeShortOk and cooldownOk and barOk
+longEntry  := dir != 1 and posState == 1 and longOk and regimeLongOk and cooldownOk and timeOK and rrOkL and lockExitDir != 1 and barOk
+shortEntry := allowShorts and dir != -1 and posState == -1 and shortOk and regimeShortOk and cooldownOk and timeOK and rrOkS and lockExitDir != -1 and barOk
 
 if longEntry
     dir := 1
@@ -301,12 +365,15 @@ if longEntry
     t1HitBar := na
     extremeSinceEntry := close
     protWarned := false
+    entryScore := scoreLong
+    entryRR := rrLong
     medHold = array.size(lHold) >= 5 ? array.median(lHold) : na
     gradeTxt = scoreLong >= 3 ? "A+" : scoreLong == 2 ? "B" : "C"
     tipTxt = "Entry " + str.tostring(close, format.mintick) +
          "\nT1 " + str.tostring(t1, format.mintick) + f_pctTxt(f_rate(lT1)) +
          "\nT2 " + str.tostring(t2, format.mintick) + f_pctTxt(f_rate(lT2)) +
          "\nStop " + str.tostring(trail, format.mintick) +
+         "\nR:R to T2 ≈ " + (na(entryRR) ? "—" : str.format("{0,number,#.#}", entryRR)) +
          "\nTypical hold " + f_dur(medHold)
     label.new(bar_index, low,
          compactLabels ? "BUY" : "BUY " + gradeTxt + "\n⏱ " + f_dur(medHold),
@@ -329,12 +396,15 @@ if shortEntry
     t1HitBar := na
     extremeSinceEntry := close
     protWarned := false
+    entryScore := scoreShort
+    entryRR := rrShort
     medHold = array.size(sHold) >= 5 ? array.median(sHold) : na
     gradeTxt = scoreShort >= 3 ? "A+" : scoreShort == 2 ? "B" : "C"
     tipTxt = "Entry " + str.tostring(close, format.mintick) +
          "\nT1 " + str.tostring(t1, format.mintick) + f_pctTxt(f_rate(sT1)) +
          "\nT2 " + str.tostring(t2, format.mintick) + f_pctTxt(f_rate(sT2)) +
          "\nStop " + str.tostring(trail, format.mintick) +
+         "\nR:R to T2 ≈ " + (na(entryRR) ? "—" : str.format("{0,number,#.#}", entryRR)) +
          "\nTypical hold " + f_dur(medHold)
     label.new(bar_index, high,
          compactLabels ? "SELL" : "SELL " + gradeTxt + "\n⏱ " + f_dur(medHold),
@@ -359,19 +429,20 @@ if dir != 0 and not na(boxT1)
     box.set_bottom(boxT2, math.min(t1, t2))
     box.set_text(boxT2, (t2Hit ? "T2 ✓ " : "T2 ") + str.tostring(t2, format.mintick))
     box.set_bgcolor(boxT2, t2Hit ? bgT2Hit : bgT2)
-    // the risk zone follows the trailing stop and flips green once risk-free
-    box.set_top(boxRisk, math.max(entryPrice, trail))
-    box.set_bottom(boxRisk, math.min(entryPrice, trail))
-    riskFree = dir == 1 ? trail >= entryPrice : trail <= entryPrice
+    // the risk zone follows the effective stop (trailing, or the tightened
+    // profit-lock stop after T2) and flips green once risk-free
+    effStop = useLock and t2Hit ? (dir == 1 ? math.max(trail, extremeSinceEntry - lockTight * atrVal) :
+         math.min(trail, extremeSinceEntry + lockTight * atrVal)) : trail
+    box.set_top(boxRisk, math.max(entryPrice, effStop))
+    box.set_bottom(boxRisk, math.min(entryPrice, effStop))
+    riskFree = dir == 1 ? effStop >= entryPrice : effStop <= entryPrice
     box.set_bgcolor(boxRisk, riskFree ? bgSafe : bgRisk)
     box.set_border_color(boxRisk, riskFree ? brSafe : brRisk)
     box.set_text_color(boxRisk, riskFree ? colBull : colBear)
-    box.set_text(boxRisk, (riskFree ? "stop ✓ " : "stop ") + str.tostring(trail, format.mintick))
+    box.set_text(boxRisk, (useLock and t2Hit ? "lock " : riskFree ? "stop ✓ " : "stop ") + str.tostring(effStop, format.mintick))
 
 // ── 4b. Profit-protection warning ────────────────────────────────────────────
 if dir != 0
-    extremeSinceEntry := dir == 1 ? math.max(nz(extremeSinceEntry, entryPrice), high) :
-         math.min(nz(extremeSinceEntry, entryPrice), low)
     peakProfit = dir == 1 ? extremeSinceEntry - entryPrice : entryPrice - extremeSinceEntry
     givenBack  = dir == 1 ? extremeSinceEntry - close : close - extremeSinceEntry
     if not protWarned and bar_index > entryBar and peakProfit >= protMinAtr * atrVal and givenBack >= peakProfit * protPct / 100 and barOk
@@ -396,7 +467,7 @@ plotshape(shortExit and not longEntry, "Exit short", shape.xcross, location.belo
 tPos = tablePosInp == "top_right" ? position.top_right :
      tablePosInp == "top_left" ? position.top_left :
      tablePosInp == "bottom_right" ? position.bottom_right : position.bottom_left
-var table tbl = table.new(tPos, 2, 16, border_width = 1, border_color = color.new(color.gray, 70),
+var table tbl = table.new(tPos, 2, 17, border_width = 1, border_color = color.new(color.gray, 70),
      frame_width = 1, frame_color = color.new(color.gray, 50), bgcolor = color.new(color.black, 25))
 
 f_cell(int row, string k, string v, color vCol) =>
@@ -458,7 +529,12 @@ if barstate.islast and showTable
     f_cell(12, "Win rate", na(winRt) ? "—" : str.format("{0,number,#}%", winRt), na(winRt) ? color.white : winRt >= 50 ? colBull : colBear)
     f_cell(13, "Avg P&L / signal", na(avgPnl) ? "—" : str.format("{0,number,#.##}%", avgPnl), na(avgPnl) ? color.white : avgPnl >= 0 ? colBull : colBear)
     f_cell(14, "Profit factor", na(pf) ? "—" : str.format("{0,number,#.##}", pf), na(pf) ? color.white : pf >= 1 ? colBull : colBear)
-    f_cell(15, "Sample", str.tostring(nSig) + " signals", color.new(color.white, 40))
+    avgA = array.size(pnlA) >= 5 ? array.avg(pnlA) : na
+    avgB = array.size(pnlB) >= 5 ? array.avg(pnlB) : na
+    f_cell(15, "A+ / B avg P&L",
+         (na(avgA) ? "—" : str.format("{0,number,#.##}%", avgA)) + " / " + (na(avgB) ? "—" : str.format("{0,number,#.##}%", avgB)),
+         color.white)
+    f_cell(16, "Sample", str.tostring(nSig) + " signals", color.new(color.white, 40))
 
 // ── 7. Alerts / notifications ────────────────────────────────────────────────
 if alertsOn
@@ -483,8 +559,9 @@ if alertsOn
         alert("⚠️ " + tick + ": giving back gains — peaked +" + str.format("{0,number,#.#}", peakPct) +
              "%, now " + str.format("{0,number,#.#}", nowPct) + "%. Consider protecting profit.", alert.freq_once_per_bar)
     if longExit or shortExit
-        alert("✖ " + tick + ": " + (longExit ? "LONG" : "SHORT") + " signal closed @ " + str.tostring(close, format.mintick) +
-             " (" + (exitPnl >= 0 ? "+" : "") + str.format("{0,number,#.##}", exitPnl) + "%) — trailing stop flipped", alert.freq_once_per_bar)
+        alert((lockExitNow ? "🔒 " : "✖ ") + tick + ": " + (longExit ? "LONG" : "SHORT") + " signal closed @ " + str.tostring(close, format.mintick) +
+             " (" + (exitPnl >= 0 ? "+" : "") + str.format("{0,number,#.##}", exitPnl) + "%) — " +
+             (lockExitNow ? "profit locked after T2" : "trailing stop flipped"), alert.freq_once_per_bar)
 
 // Static conditions, if you prefer separate alerts per event type
 alertcondition(longEntry,  "BUY signal",  "IREN Signal Pro V2: BUY — targets & hold time on chart")
