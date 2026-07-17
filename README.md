@@ -24,6 +24,11 @@ Note: with the filters on, V2 fires noticeably fewer signals than V1 — that's 
 - **R:R quality filter** — optionally skip entries whose reward to T2 is below a minimum multiple of the stop distance ("Min reward:risk to T2"; 0 = off, try 0.8–1.0). Every entry tooltip now shows its R:R.
 - **A+ vs B performance split** — the dashboard shows average P&L per closed A+ signal vs B signal separately. If B signals consistently lose, set "Min confirmations" to 3 and trade only A+.
 
+### V2.2 additions
+
+- **Anti-chase guards** — two new "Entry quality" filters: entries are blocked when price is already stretched more than 1.5 × ATR beyond the slow EMA (no more buying exhaustion spikes at the top of a run), and an entry must come within 6 bars of the trailing-stop flip (no late entries into a move that has already played out). Both configurable, 0 = off.
+- **Clean history** — when a trade closes, its zones keep their colors but drop the T1/T2/stop price text (a ✓ remains on hit targets). Only the active trade shows prices, which removes most label clutter from past signals. Re-enable via "Keep price text on closed zones" if you want the old behavior.
+
 A Pine Script v5 indicator built for **NASDAQ:IREN** (works on any symbol) that gives:
 
 - **BUY / SELL signals** — an ATR trailing-stop engine (UT-Bot style) confirmed by trend (EMA 9/21), momentum (RSI 14) and volume.

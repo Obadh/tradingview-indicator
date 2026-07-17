@@ -22,6 +22,11 @@
 //     to T2 is poor relative to the stop distance.
 //   • Grade performance split — average P&L of A+ vs B signals in the
 //     dashboard, so you can judge whether B signals earn their keep.
+//   • Anti-chase guards — entries are blocked when price is stretched more
+//     than maxExt × ATR beyond the slow EMA (exhaustion spikes) or more than
+//     maxLag bars after the trend flip (late entries into a move that ran).
+//   • Clean history — closed zones keep their colors but drop the price
+//     text, so only the active trade shows T1/T2/stop prices.
 //
 // V1 recap: ATR trailing-stop signal engine confirmed by EMA/RSI/volume,
 // shaded reward/risk zones, adaptive momentum-driven targets, self-measured
@@ -64,6 +69,12 @@ cooldownBars = input.int(3, "Cooldown — min bars between entries", minval = 0,
 rrMin        = input.float(0, "Min reward:risk to T2 (0 = off)", minval = 0, step = 0.1, group = grpReg,
      tooltip = "Skip entries where (distance to T2) ÷ (distance to stop) is below this. Try 0.8–1.0 to only take trades with decent payoff potential. 0 disables the filter.")
 
+grpQ = "Entry quality (V2)"
+maxExt = input.float(1.5, "Max extension from slow EMA (× ATR, 0 = off)", minval = 0, step = 0.1, group = grpQ,
+     tooltip = "Blocks entries when price is already stretched more than this far beyond the slow EMA — stops buying exhaustion spikes at the top (and shorting flush lows).")
+maxLag = input.int(6, "Max bars after trend flip to enter (0 = off)", minval = 0, group = grpQ,
+     tooltip = "An entry must happen within this many bars of the trailing-stop flip. Blocks late entries into a move that has already run.")
+
 grpTime = "Timing filters (V2)"
 skipOpen = input.bool(true, "Skip first 15 min after the open (09:30–09:45 ET)", group = grpTime,
      tooltip = "The opening range is the most whipsaw-prone window of the day. Entries are blocked there; exits still work. Intraday charts only.")
@@ -93,6 +104,8 @@ showTable     = input.bool(true, "Show stats dashboard", group = grpUi)
 tablePosInp   = input.string("top_right", "Dashboard position",
      options = ["top_right", "top_left", "bottom_right", "bottom_left"], group = grpUi)
 compactLabels = input.bool(false, "Compact signal labels (details in tooltip)", group = grpUi)
+historyText   = input.bool(false, "Keep price text on closed zones", group = grpUi,
+     tooltip = "Off (default): when a trade closes, its zones keep their colors but drop the T1/T2/stop price text — much cleaner history. Prices of the ACTIVE trade are always shown.")
 showEmaRibbon = input.bool(true, "Show EMA 9/21 ribbon", group = grpUi)
 showTrail     = input.bool(false, "Show ATR trailing stop line", group = grpUi,
      tooltip = "The stop is already visible as the bottom edge of the red risk zone; enable this to also draw it as a line across the whole chart.")
@@ -141,6 +154,9 @@ trail := close > nz(trail[1]) and close[1] > nz(trail[1]) ? math.max(nz(trail[1]
 
 var int posState = 0
 posState := close > trail ? 1 : close < trail ? -1 : nz(posState[1])
+var int flipBar = na
+if posState != nz(posState[1])
+    flipBar := bar_index
 
 baseBuy  = ta.crossover(close, trail)
 baseSell = ta.crossunder(close, trail)
@@ -182,6 +198,11 @@ rrLong  = close - trail > 0 ? (t2CandL - close) / (close - trail) : na
 rrShort = trail - close > 0 ? (close - t2CandS) / (trail - close) : na
 rrOkL   = rrMin == 0 or (not na(rrLong) and rrLong >= rrMin)
 rrOkS   = rrMin == 0 or (not na(rrShort) and rrShort >= rrMin)
+
+// Entry quality gates (V2): don't chase stretched or stale moves
+extOkL = maxExt == 0 or close - emaS <= maxExt * atrVal
+extOkS = maxExt == 0 or emaS - close <= maxExt * atrVal
+lagOk  = maxLag == 0 or (not na(flipBar) and bar_index - flipBar <= maxLag)
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 f_rate(arr) =>
@@ -340,6 +361,11 @@ if longExit or shortExit
     box.set_right(boxT1, bar_index)
     box.set_right(boxT2, bar_index)
     box.set_right(boxRisk, bar_index)
+    // closed zones keep their colors but drop the price text — clean history
+    if not historyText
+        box.set_text(boxT1, t1Hit ? "✓" : "")
+        box.set_text(boxT2, t2Hit ? "✓" : "")
+        box.set_text(boxRisk, "")
 
 // ── 3. Entries (V2: gated by regime, cooldown, timing, R:R, profit-lock) ────
 // After a profit-lock exit, same-direction re-entry stays blocked until the
@@ -350,8 +376,8 @@ if baseSell and lockExitDir == -1
     lockExitDir := 0
 
 cooldownOk = na(lastEntryBar) or bar_index - lastEntryBar >= cooldownBars
-longEntry  := dir != 1 and posState == 1 and longOk and regimeLongOk and cooldownOk and timeOK and rrOkL and lockExitDir != 1 and barOk
-shortEntry := allowShorts and dir != -1 and posState == -1 and shortOk and regimeShortOk and cooldownOk and timeOK and rrOkS and lockExitDir != -1 and barOk
+longEntry  := dir != 1 and posState == 1 and longOk and regimeLongOk and cooldownOk and timeOK and rrOkL and extOkL and lagOk and lockExitDir != 1 and barOk
+shortEntry := allowShorts and dir != -1 and posState == -1 and shortOk and regimeShortOk and cooldownOk and timeOK and rrOkS and extOkS and lagOk and lockExitDir != -1 and barOk
 
 if longEntry
     dir := 1
