@@ -1,5 +1,22 @@
 # IREN Signal Pro — TradingView Indicator
 
+**Two versions in this repo:**
+
+| File | What it is |
+|---|---|
+| [`iren_signal_pro_v2.pine`](iren_signal_pro_v2.pine) | **Recommended.** Everything in V1 plus market-regime filters (ADX chop filter, higher-timeframe trend filter, signal cooldown), profitability stats (win rate, avg P&L per signal, profit factor) and a compact-labels mode. Fewer, better signals. |
+| [`iren_signal_pro.pine`](iren_signal_pro.pine) | V1 — the original engine. More signals, no regime filtering. Keep it if you want to compare. |
+
+## What's new in V2
+
+- **ADX chop filter** — entries are blocked while ADX is below 20 (configurable). Sideways ranges are where the losing whipsaw flips happen; those periods are shaded gray on the chart so you can see why it's staying out.
+- **Higher-timeframe trend filter** — longs only while price is above the 1h EMA 50, shorts only below it (both configurable). Stops you from fighting the bigger trend.
+- **Signal cooldown** — a minimum number of bars (default 3) between entries, killing rapid-fire flip clusters.
+- **Profitability stats in the dashboard** — hit rate tells you how often T1 is tagged, but not whether the engine makes money. V2 records the realized P&L of every closed signal and shows **Win rate**, **Avg P&L per signal**, and **Profit factor** (gross wins ÷ gross losses; above 1 = profitable). A **Regime** row shows TRENDING/CHOPPY with the live ADX.
+- **Compact labels** — optional tiny BUY/SELL tags with the full details in a hover tooltip, for busy charts.
+
+Note: with the filters on, V2 fires noticeably fewer signals than V1 — that's the point. If it feels too quiet, lower "Min ADX" to 15 or disable the HTF filter.
+
 A Pine Script v5 indicator built for **NASDAQ:IREN** (works on any symbol) that gives:
 
 - **BUY / SELL signals** — an ATR trailing-stop engine (UT-Bot style) confirmed by trend (EMA 9/21), momentum (RSI 14) and volume.

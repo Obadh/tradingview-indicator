@@ -1,0 +1,495 @@
+//@version=5
+// ─────────────────────────────────────────────────────────────────────────────
+// IREN Signal Pro V2 — Buy/Sell signals + adaptive targets + regime filters
+//
+// Everything from V1, plus:
+//   • ADX chop filter — no entries while the market is ranging (choppy
+//     periods are shaded gray so you can see why it stays out).
+//   • Higher-timeframe trend filter — longs only above the 1h EMA 50,
+//     shorts only below it (timeframe/length configurable).
+//   • Signal cooldown — a minimum number of bars between entries, which
+//     kills the rapid-fire flip clusters in sideways markets.
+//   • Profitability statistics — win rate, average P&L per signal and
+//     profit factor in the dashboard, so you can judge whether the engine
+//     actually makes money on this symbol, not just how often it hits T1.
+//   • Compact label mode — tiny BUY/SELL tags, full details in the tooltip.
+//
+// V1 recap: ATR trailing-stop signal engine confirmed by EMA/RSI/volume,
+// shaded reward/risk zones, adaptive momentum-driven targets, self-measured
+// hit rates and hold times, dynamic phone notifications with a
+// profit-protection warning.
+//
+// Honest disclaimer: no target is ever reached "for sure". T1 is the target
+// with the highest measured probability; the dashboard shows you the exact
+// historical hit rate so you can judge it yourself.
+// ─────────────────────────────────────────────────────────────────────────────
+indicator("IREN Signal Pro V2 — Signals + Adaptive Targets + Regime Filters",
+     shorttitle = "IREN Signal Pro V2",
+     overlay = true,
+     max_labels_count = 500,
+     max_lines_count = 500,
+     max_boxes_count = 500)
+
+// ── Inputs ───────────────────────────────────────────────────────────────────
+grpSig = "Signal engine"
+atrLen          = input.int(10,   "ATR length",                        minval = 1,   group = grpSig)
+atrMult         = input.float(1.8,"ATR sensitivity (trailing stop)",   minval = 0.1, step = 0.1, group = grpSig,
+     tooltip = "Lower = more signals (scalping). Higher = fewer, longer signals (swing). 1.5–2.0 works well on IREN 15m; use 2.5–3.0 on the daily chart.")
+minScore        = input.int(2,    "Min confirmations required (0–3)",  minval = 0, maxval = 3, group = grpSig,
+     tooltip = "Confirmations: EMA trend, RSI momentum, volume. 3 = only A+ signals, 2 = balanced (default), 0 = every flip.")
+allowShorts     = input.bool(true,"Show SELL (short) entries",         group = grpSig)
+confirmBarClose = input.bool(true,"Confirm signals on bar close (no repaint)", group = grpSig)
+
+grpReg = "Market regime filters (V2)"
+useAdx       = input.bool(true, "Chop filter — require trending market (ADX)", group = grpReg,
+     tooltip = "Entries are blocked while ADX is below the threshold. This is what removes the losing whipsaw clusters in sideways ranges.")
+adxLen       = input.int(14, "ADX length", minval = 1, group = grpReg)
+adxMin       = input.float(20, "Min ADX to allow entries", minval = 5, maxval = 50, step = 1, group = grpReg)
+shadeChop    = input.bool(true, "Shade choppy periods gray", group = grpReg)
+useHtf       = input.bool(true, "Higher-timeframe trend filter", group = grpReg,
+     tooltip = "Longs only while price is above the higher-timeframe EMA, shorts only below it. Keeps you from fighting the bigger trend.")
+htfTf        = input.timeframe("60", "Higher timeframe", group = grpReg)
+htfLen       = input.int(50, "HTF EMA length", minval = 1, group = grpReg)
+cooldownBars = input.int(3, "Cooldown — min bars between entries", minval = 0, group = grpReg,
+     tooltip = "Blocks a new entry for this many bars after the previous one, killing rapid-fire flip clusters.")
+
+grpFlt = "Confirmations"
+emaFastLen = input.int(9,    "Fast EMA",                     group = grpFlt)
+emaSlowLen = input.int(21,   "Slow EMA",                     group = grpFlt)
+rsiLen     = input.int(14,   "RSI length",                   group = grpFlt)
+volLen     = input.int(20,   "Volume average length",        group = grpFlt)
+volMult    = input.float(1.0,"Volume must exceed × average", step = 0.1, group = grpFlt)
+
+grpTgt = "Targets"
+t1Mult = input.float(1.0, "T1 — high-probability target (× ATR)", step = 0.1, group = grpTgt)
+t2Mult = input.float(2.2, "T2 — stretch target (× ATR)",          step = 0.1, group = grpTgt)
+adaptTargets = input.bool(true, "Adaptive targets (follow live momentum)", group = grpTgt,
+     tooltip = "Targets are re-evaluated every bar from the current momentum strength (RSI, EMA trend, volume). Strong readings extend the targets up to ~1.3–1.5× their base size; fading readings pull them in to ~0.6–0.7×. A target locks the moment it is hit.")
+adaptSpeed = input.float(0.25, "Adaptation speed", minval = 0.05, maxval = 1, step = 0.05, group = grpTgt,
+     tooltip = "How fast targets move toward their new level each bar. 0.25 = smooth, 1 = instant.")
+
+grpUi = "Display"
+showTable     = input.bool(true, "Show stats dashboard", group = grpUi)
+tablePosInp   = input.string("top_right", "Dashboard position",
+     options = ["top_right", "top_left", "bottom_right", "bottom_left"], group = grpUi)
+compactLabels = input.bool(false, "Compact signal labels (details in tooltip)", group = grpUi)
+showEmaRibbon = input.bool(true, "Show EMA 9/21 ribbon", group = grpUi)
+showTrail     = input.bool(false, "Show ATR trailing stop line", group = grpUi,
+     tooltip = "The stop is already visible as the bottom edge of the red risk zone; enable this to also draw it as a line across the whole chart.")
+
+grpAl = "Notifications"
+alertsOn   = input.bool(true, "Send dynamic notifications", group = grpAl,
+     tooltip = "Create ONE alert on this indicator with condition 'Any alert() function call' and every event (BUY, SELL, T1/T2 hit, exit, profit-protection warning) is pushed with live prices. See README.")
+protPct    = input.float(50, "Warn after giving back % of peak profit", minval = 10, maxval = 90, step = 5, group = grpAl,
+     tooltip = "Profit-protection warning: fires once per trade when the open profit has retraced this much from its peak.")
+protMinAtr = input.float(0.8, "…only if peak profit was ≥ × ATR", minval = 0.1, step = 0.1, group = grpAl,
+     tooltip = "Avoids noise warnings on trades that never really moved.")
+
+// ── Colors ───────────────────────────────────────────────────────────────────
+colBull  = color.new(#089981, 0)
+colBear  = color.new(#f23645, 0)
+colT1    = color.new(#26c281, 0)
+colT2    = color.new(#00bcd4, 0)
+colFlat  = color.new(#787b86, 0)
+
+bgT1     = color.new(#26c281, 82)
+bgT1Hit  = color.new(#26c281, 68)
+bgT2     = color.new(#00bcd4, 90)
+bgT2Hit  = color.new(#00bcd4, 76)
+bgRisk   = color.new(#f23645, 84)
+bgSafe   = color.new(#089981, 90)
+brT1     = color.new(#26c281, 55)
+brT2     = color.new(#00bcd4, 65)
+brRisk   = color.new(#f23645, 55)
+brSafe   = color.new(#089981, 55)
+
+// ── Core series ──────────────────────────────────────────────────────────────
+atrVal  = ta.atr(atrLen)
+emaF    = ta.ema(close, emaFastLen)
+emaS    = ta.ema(close, emaSlowLen)
+rsiVal  = ta.rsi(close, rsiLen)
+volAvg  = ta.sma(volume, volLen)
+[diPlus, diMinus, adxVal] = ta.dmi(adxLen, adxLen)
+htfEma  = request.security(syminfo.tickerid, htfTf, ta.ema(close, htfLen), barmerge.gaps_off, barmerge.lookahead_off)
+
+// ATR trailing stop (UT-Bot style)
+nLoss = atrMult * atrVal
+var float trail = na
+trail := close > nz(trail[1]) and close[1] > nz(trail[1]) ? math.max(nz(trail[1]), close - nLoss) :
+     close < nz(trail[1]) and close[1] < nz(trail[1]) ? math.min(nz(trail[1]), close + nLoss) :
+     close > nz(trail[1]) ? close - nLoss : close + nLoss
+
+var int posState = 0
+posState := close > trail ? 1 : close < trail ? -1 : nz(posState[1])
+
+baseBuy  = ta.crossover(close, trail)
+baseSell = ta.crossunder(close, trail)
+
+// Confirmation score
+volOk      = not na(volAvg) and volume > volAvg * volMult
+scoreLong  = (emaF > emaS ? 1 : 0) + (rsiVal > 50 ? 1 : 0) + (volOk ? 1 : 0)
+scoreShort = (emaF < emaS ? 1 : 0) + (rsiVal < 50 ? 1 : 0) + (volOk ? 1 : 0)
+longOk     = scoreLong  >= minScore
+shortOk    = scoreShort >= minScore
+barOk      = not confirmBarClose or barstate.isconfirmed
+
+// Market regime gates (V2)
+trending     = not useAdx or adxVal >= adxMin
+regimeLongOk  = trending and (not useHtf or close > htfEma)
+regimeShortOk = trending and (not useHtf or close < htfEma)
+
+// Momentum strength 0..1 — drives the adaptive targets
+f_clamp01(float x) =>
+    math.max(0.0, math.min(1.0, x))
+volRatio  = na(volAvg) or volAvg == 0 ? 1.0 : volume / volAvg
+compVol   = f_clamp01((volRatio - 0.8) / 1.2)
+strLong   = (f_clamp01((rsiVal - 50) / 25) + f_clamp01((emaF - emaS) / atrVal) + compVol) / 3
+strShort  = (f_clamp01((50 - rsiVal) / 25) + f_clamp01((emaS - emaF) / atrVal) + compVol) / 3
+
+// target size factors: weak momentum ≈ 0.7×/0.6× base, max momentum ≈ 1.3×/1.5×
+f_t1Factor(float s) => 0.7 + 0.6 * s
+f_t2Factor(float s) => 0.6 + 0.9 * s
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+f_rate(arr) =>
+    float r = na
+    if array.size(arr) >= 5
+        r := array.avg(arr) * 100
+    r
+
+f_dur(float nBars) =>
+    string out = "—"
+    if not na(nBars)
+        float mins = nBars * timeframe.in_seconds() / 60.0
+        out := mins < 90 ? str.format("~{0,number,#} min", mins) :
+             mins < 60 * 36 ? str.format("~{0,number,#.#} h", mins / 60) :
+             str.format("~{0,number,#.#} d", mins / 1440)
+    out
+
+f_pctTxt(float r) =>
+    na(r) ? "" : str.format(" · hit {0,number,#}%", r)
+
+// ── Trade state ──────────────────────────────────────────────────────────────
+var int   dir        = 0
+var float entryPrice = na
+var int   entryBar   = na
+var float t1         = na
+var float t2         = na
+var bool  t1Hit      = false
+var bool  t2Hit      = false
+var int   t1HitBar   = na
+var box   boxT1      = na
+var box   boxT2      = na
+var box   boxRisk    = na
+var float extremeSinceEntry = na
+var bool  protWarned = false
+var int   lastEntryBar = na
+
+// Historical statistics (long / short kept separate)
+var lHold  = array.new_float()
+var lT1    = array.new_float()
+var lT2    = array.new_float()
+var lToT1  = array.new_float()
+var lPnl   = array.new_float()  // realized P&L % per closed long signal (V2)
+var sHold  = array.new_float()
+var sT1    = array.new_float()
+var sT2    = array.new_float()
+var sToT1  = array.new_float()
+var sPnl   = array.new_float()
+
+f_pushCapped(arr, val) =>
+    array.push(arr, val)
+    if array.size(arr) > 300
+        array.shift(arr)
+
+// Draw the three reward/risk zones for a fresh signal
+f_zones(float eP, float tp1, float tp2, float stp) =>
+    b1 = box.new(bar_index, math.max(eP, tp1), bar_index + 1, math.min(eP, tp1),
+         border_color = brT1, border_width = 1, bgcolor = bgT1,
+         text = "T1 " + str.tostring(tp1, format.mintick), text_color = colT1,
+         text_size = size.small, text_halign = text.align_right, text_valign = text.align_center)
+    b2 = box.new(bar_index, math.max(tp1, tp2), bar_index + 1, math.min(tp1, tp2),
+         border_color = brT2, border_width = 1, bgcolor = bgT2,
+         text = "T2 " + str.tostring(tp2, format.mintick), text_color = colT2,
+         text_size = size.small, text_halign = text.align_right, text_valign = text.align_center)
+    b3 = box.new(bar_index, math.max(eP, stp), bar_index + 1, math.min(eP, stp),
+         border_color = brRisk, border_width = 1, bgcolor = bgRisk,
+         text = "stop " + str.tostring(stp, format.mintick), text_color = colBear,
+         text_size = size.small, text_halign = text.align_right, text_valign = text.align_center)
+    [b1, b2, b3]
+
+// Per-bar event flags (for plots & alerts)
+bool longEntry   = false
+bool shortEntry  = false
+bool longExit    = false
+bool shortExit   = false
+bool t1HitNow    = false
+bool t2HitNow    = false
+bool protWarnNow = false
+float exitPnl    = na
+
+// ── 0. Adapt the open targets to the current readings ───────────────────────
+if adaptTargets and dir != 0 and bar_index > entryBar
+    s = dir == 1 ? strLong : strShort
+    if not t1Hit
+        newT1 = entryPrice + dir * t1Mult * f_t1Factor(s) * atrVal
+        t1 := t1 + (newT1 - t1) * adaptSpeed
+    if not t2Hit
+        newT2 = entryPrice + dir * t2Mult * f_t2Factor(s) * atrVal
+        t2 := t2 + (newT2 - t2) * adaptSpeed
+        minT2 = t1 + dir * 0.3 * atrVal
+        t2 := dir == 1 ? math.max(t2, minT2) : math.min(t2, minT2)
+
+// ── 1. Track target hits on the open signal ─────────────────────────────────
+if dir == 1 and bar_index > entryBar
+    if not t1Hit and high >= t1
+        t1Hit := true
+        t1HitBar := bar_index
+        t1HitNow := true
+    if not t2Hit and high >= t2
+        t2Hit := true
+        t2HitNow := true
+if dir == -1 and bar_index > entryBar
+    if not t1Hit and low <= t1
+        t1Hit := true
+        t1HitBar := bar_index
+        t1HitNow := true
+    if not t2Hit and low <= t2
+        t2Hit := true
+        t2HitNow := true
+
+// ── 2. Exits (a trailing-stop flip always closes the open signal) ───────────
+if dir == 1 and baseSell and barOk
+    f_pushCapped(lHold, bar_index - entryBar)
+    f_pushCapped(lT1, t1Hit ? 1.0 : 0.0)
+    f_pushCapped(lT2, t2Hit ? 1.0 : 0.0)
+    if t1Hit
+        f_pushCapped(lToT1, t1HitBar - entryBar)
+    exitPnl := (close / entryPrice - 1) * 100
+    f_pushCapped(lPnl, exitPnl)
+    longExit := true
+    dir := 0
+if dir == -1 and baseBuy and barOk
+    f_pushCapped(sHold, bar_index - entryBar)
+    f_pushCapped(sT1, t1Hit ? 1.0 : 0.0)
+    f_pushCapped(sT2, t2Hit ? 1.0 : 0.0)
+    if t1Hit
+        f_pushCapped(sToT1, t1HitBar - entryBar)
+    exitPnl := (entryPrice - close) / entryPrice * 100
+    f_pushCapped(sPnl, exitPnl)
+    shortExit := true
+    dir := 0
+if longExit or shortExit
+    box.set_right(boxT1, bar_index)
+    box.set_right(boxT2, bar_index)
+    box.set_right(boxRisk, bar_index)
+
+// ── 3. Entries (V2: gated by regime filters and cooldown) ───────────────────
+cooldownOk = na(lastEntryBar) or bar_index - lastEntryBar >= cooldownBars
+longEntry  := dir != 1 and posState == 1 and longOk and regimeLongOk and cooldownOk and barOk
+shortEntry := allowShorts and dir != -1 and posState == -1 and shortOk and regimeShortOk and cooldownOk and barOk
+
+if longEntry
+    dir := 1
+    entryPrice := close
+    entryBar := bar_index
+    lastEntryBar := bar_index
+    t1 := close + t1Mult * (adaptTargets ? f_t1Factor(strLong) : 1.0) * atrVal
+    t2 := close + t2Mult * (adaptTargets ? f_t2Factor(strLong) : 1.0) * atrVal
+    t1Hit := false
+    t2Hit := false
+    t1HitBar := na
+    extremeSinceEntry := close
+    protWarned := false
+    medHold = array.size(lHold) >= 5 ? array.median(lHold) : na
+    gradeTxt = scoreLong >= 3 ? "A+" : scoreLong == 2 ? "B" : "C"
+    tipTxt = "Entry " + str.tostring(close, format.mintick) +
+         "\nT1 " + str.tostring(t1, format.mintick) + f_pctTxt(f_rate(lT1)) +
+         "\nT2 " + str.tostring(t2, format.mintick) + f_pctTxt(f_rate(lT2)) +
+         "\nStop " + str.tostring(trail, format.mintick) +
+         "\nTypical hold " + f_dur(medHold)
+    label.new(bar_index, low,
+         compactLabels ? "BUY" : "BUY " + gradeTxt + "\n⏱ " + f_dur(medHold),
+         style = label.style_label_up, color = colBull, textcolor = color.white,
+         size = compactLabels ? size.tiny : size.small, tooltip = tipTxt)
+    [b1, b2, b3] = f_zones(entryPrice, t1, t2, trail)
+    boxT1 := b1
+    boxT2 := b2
+    boxRisk := b3
+
+if shortEntry
+    dir := -1
+    entryPrice := close
+    entryBar := bar_index
+    lastEntryBar := bar_index
+    t1 := close - t1Mult * (adaptTargets ? f_t1Factor(strShort) : 1.0) * atrVal
+    t2 := close - t2Mult * (adaptTargets ? f_t2Factor(strShort) : 1.0) * atrVal
+    t1Hit := false
+    t2Hit := false
+    t1HitBar := na
+    extremeSinceEntry := close
+    protWarned := false
+    medHold = array.size(sHold) >= 5 ? array.median(sHold) : na
+    gradeTxt = scoreShort >= 3 ? "A+" : scoreShort == 2 ? "B" : "C"
+    tipTxt = "Entry " + str.tostring(close, format.mintick) +
+         "\nT1 " + str.tostring(t1, format.mintick) + f_pctTxt(f_rate(sT1)) +
+         "\nT2 " + str.tostring(t2, format.mintick) + f_pctTxt(f_rate(sT2)) +
+         "\nStop " + str.tostring(trail, format.mintick) +
+         "\nTypical hold " + f_dur(medHold)
+    label.new(bar_index, high,
+         compactLabels ? "SELL" : "SELL " + gradeTxt + "\n⏱ " + f_dur(medHold),
+         style = label.style_label_down, color = colBear, textcolor = color.white,
+         size = compactLabels ? size.tiny : size.small, tooltip = tipTxt)
+    [b1, b2, b3] = f_zones(entryPrice, t1, t2, trail)
+    boxT1 := b1
+    boxT2 := b2
+    boxRisk := b3
+
+// ── 4. Keep the zones attached to the open signal ───────────────────────────
+if dir != 0 and not na(boxT1)
+    box.set_right(boxT1, bar_index + 1)
+    box.set_right(boxT2, bar_index + 1)
+    box.set_right(boxRisk, bar_index + 1)
+    // target zones follow the adaptive targets and lock/darken once hit
+    box.set_top(boxT1, math.max(entryPrice, t1))
+    box.set_bottom(boxT1, math.min(entryPrice, t1))
+    box.set_text(boxT1, (t1Hit ? "T1 ✓ " : "T1 ") + str.tostring(t1, format.mintick))
+    box.set_bgcolor(boxT1, t1Hit ? bgT1Hit : bgT1)
+    box.set_top(boxT2, math.max(t1, t2))
+    box.set_bottom(boxT2, math.min(t1, t2))
+    box.set_text(boxT2, (t2Hit ? "T2 ✓ " : "T2 ") + str.tostring(t2, format.mintick))
+    box.set_bgcolor(boxT2, t2Hit ? bgT2Hit : bgT2)
+    // the risk zone follows the trailing stop and flips green once risk-free
+    box.set_top(boxRisk, math.max(entryPrice, trail))
+    box.set_bottom(boxRisk, math.min(entryPrice, trail))
+    riskFree = dir == 1 ? trail >= entryPrice : trail <= entryPrice
+    box.set_bgcolor(boxRisk, riskFree ? bgSafe : bgRisk)
+    box.set_border_color(boxRisk, riskFree ? brSafe : brRisk)
+    box.set_text_color(boxRisk, riskFree ? colBull : colBear)
+    box.set_text(boxRisk, (riskFree ? "stop ✓ " : "stop ") + str.tostring(trail, format.mintick))
+
+// ── 4b. Profit-protection warning ────────────────────────────────────────────
+if dir != 0
+    extremeSinceEntry := dir == 1 ? math.max(nz(extremeSinceEntry, entryPrice), high) :
+         math.min(nz(extremeSinceEntry, entryPrice), low)
+    peakProfit = dir == 1 ? extremeSinceEntry - entryPrice : entryPrice - extremeSinceEntry
+    givenBack  = dir == 1 ? extremeSinceEntry - close : close - extremeSinceEntry
+    if not protWarned and bar_index > entryBar and peakProfit >= protMinAtr * atrVal and givenBack >= peakProfit * protPct / 100 and barOk
+        protWarned := true
+        protWarnNow := true
+        label.new(bar_index, dir == 1 ? high : low, "⚠ protect",
+             style = dir == 1 ? label.style_label_down : label.style_label_up,
+             color = color.new(color.orange, 15), textcolor = color.white, size = size.small,
+             tooltip = "Position has given back " + str.tostring(protPct, "#") + "% of its peak profit — consider taking money off the table.")
+
+// ── 5. Plots ─────────────────────────────────────────────────────────────────
+bgcolor(shadeChop and useAdx and adxVal < adxMin ? color.new(color.gray, 92) : na, title = "Choppy market (no entries)")
+plot(showTrail and bar_index > atrLen ? trail : na, "ATR trailing stop",
+     color = posState == 1 ? colBull : colBear, linewidth = 2)
+pF = plot(showEmaRibbon ? emaF : na, "EMA fast", color = color.new(colBull, 60))
+pS = plot(showEmaRibbon ? emaS : na, "EMA slow", color = color.new(colBear, 60))
+fill(pF, pS, color = emaF > emaS ? color.new(colBull, 88) : color.new(colBear, 88), title = "EMA ribbon")
+plotshape(longExit and not shortEntry, "Exit long", shape.xcross, location.abovebar, colFlat, size = size.tiny)
+plotshape(shortExit and not longEntry, "Exit short", shape.xcross, location.belowbar, colFlat, size = size.tiny)
+
+// ── 6. Dashboard ─────────────────────────────────────────────────────────────
+tPos = tablePosInp == "top_right" ? position.top_right :
+     tablePosInp == "top_left" ? position.top_left :
+     tablePosInp == "bottom_right" ? position.bottom_right : position.bottom_left
+var table tbl = table.new(tPos, 2, 16, border_width = 1, border_color = color.new(color.gray, 70),
+     frame_width = 1, frame_color = color.new(color.gray, 50), bgcolor = color.new(color.black, 25))
+
+f_cell(int row, string k, string v, color vCol) =>
+    table.cell(tbl, 0, row, k, text_color = color.new(color.white, 30), text_size = size.small, text_halign = text.align_left)
+    table.cell(tbl, 1, row, v, text_color = vCol, text_size = size.small, text_halign = text.align_right)
+
+// Combined profitability over all closed signals (V2)
+f_sumStats(arr, res) =>
+    // res: [n, wins, sum, grossWin, grossLoss]
+    if array.size(arr) > 0
+        for i = 0 to array.size(arr) - 1
+            p = array.get(arr, i)
+            array.set(res, 0, array.get(res, 0) + 1)
+            array.set(res, 1, array.get(res, 1) + (p > 0 ? 1 : 0))
+            array.set(res, 2, array.get(res, 2) + p)
+            array.set(res, 3, array.get(res, 3) + (p > 0 ? p : 0))
+            array.set(res, 4, array.get(res, 4) + (p < 0 ? -p : 0))
+    res
+
+if barstate.islast and showTable
+    isLong  = dir == 1
+    holdArr = isLong ? lHold : sHold
+    t1Arr   = isLong ? lT1 : sT1
+    t2Arr   = isLong ? lT2 : sT2
+    toT1Arr = isLong ? lToT1 : sToT1
+    medHold = array.size(holdArr) >= 5 ? array.median(holdArr) : na
+    medToT1 = array.size(toT1Arr) >= 5 ? array.median(toT1Arr) : na
+    age     = dir != 0 ? bar_index - entryBar : na
+    remain  = not na(medHold) and not na(age) ? math.max(medHold - age, 0) : na
+    pnl     = dir != 0 ? (close / entryPrice - 1) * 100 * dir : na
+    nSig    = array.size(lHold) + array.size(sHold)
+
+    stats = array.new_float(5, 0.0)
+    stats := f_sumStats(lPnl, stats)
+    stats := f_sumStats(sPnl, stats)
+    n      = array.get(stats, 0)
+    winRt  = n >= 5 ? array.get(stats, 1) / n * 100 : na
+    avgPnl = n >= 5 ? array.get(stats, 2) / n : na
+    gLoss  = array.get(stats, 4)
+    pf     = n >= 5 ? (gLoss > 0 ? array.get(stats, 3) / gLoss : na) : na
+
+    table.cell(tbl, 0, 0, "IREN SIGNAL PRO V2", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(tbl, 1, 0, timeframe.period + (timeframe.isintraday ? "m" : ""), text_color = color.new(color.white, 40), text_size = size.small, text_halign = text.align_right)
+
+    f_cell(1, "Signal", dir == 1 ? "LONG ▲" : dir == -1 ? "SHORT ▼" : "FLAT — wait", dir == 1 ? colBull : dir == -1 ? colBear : colFlat)
+    f_cell(2, "Entry", dir != 0 ? str.tostring(entryPrice, format.mintick) : "—", color.white)
+    f_cell(3, "Open P&L", not na(pnl) ? str.format("{0,number,#.##}%", pnl) : "—", not na(pnl) and pnl >= 0 ? colBull : colBear)
+    f_cell(4, "T1 (high-prob)", dir != 0 ? str.tostring(t1, format.mintick) + (t1Hit ? "  ✓" : "") + (na(f_rate(t1Arr)) ? "" : str.format("  ({0,number,#}%)", f_rate(t1Arr))) : "—", colT1)
+    f_cell(5, "T2 (stretch)", dir != 0 ? str.tostring(t2, format.mintick) + (t2Hit ? "  ✓" : "") + (na(f_rate(t2Arr)) ? "" : str.format("  ({0,number,#}%)", f_rate(t2Arr))) : "—", colT2)
+    f_cell(6, "Trailing stop", str.tostring(trail, format.mintick), posState == 1 ? colBull : colBear)
+    f_cell(7, "Typical hold", f_dur(medHold), color.white)
+    f_cell(8, "Time to T1", f_dur(medToT1), color.white)
+    f_cell(9, "Est. remaining", dir != 0 ? f_dur(remain) : "—", color.white)
+    sAct = dir == -1 or (dir == 0 and posState == -1) ? strShort : strLong
+    momTxt = str.format("{0,number,#}%", sAct * 100) + (not adaptTargets ? "" : sAct > 0.65 ? " ▲ extending" : sAct < 0.35 ? " ▼ pulling in" : " → steady")
+    f_cell(10, "Momentum", momTxt, sAct > 0.65 ? colBull : sAct < 0.35 ? colBear : color.white)
+    regTxt = (trending ? "TRENDING" : "CHOPPY — no entries") + (useAdx ? str.format(" (ADX {0,number,#})", adxVal) : "")
+    f_cell(11, "Regime", regTxt, trending ? colBull : colFlat)
+    f_cell(12, "Win rate", na(winRt) ? "—" : str.format("{0,number,#}%", winRt), na(winRt) ? color.white : winRt >= 50 ? colBull : colBear)
+    f_cell(13, "Avg P&L / signal", na(avgPnl) ? "—" : str.format("{0,number,#.##}%", avgPnl), na(avgPnl) ? color.white : avgPnl >= 0 ? colBull : colBear)
+    f_cell(14, "Profit factor", na(pf) ? "—" : str.format("{0,number,#.##}", pf), na(pf) ? color.white : pf >= 1 ? colBull : colBear)
+    f_cell(15, "Sample", str.tostring(nSig) + " signals", color.new(color.white, 40))
+
+// ── 7. Alerts / notifications ────────────────────────────────────────────────
+if alertsOn
+    tick = syminfo.ticker
+    if longEntry
+        alert("🟢 BUY " + tick + " @ " + str.tostring(close, format.mintick) +
+             " | T1 " + str.tostring(t1, format.mintick) + " · T2 " + str.tostring(t2, format.mintick) +
+             " | stop " + str.tostring(trail, format.mintick), alert.freq_once_per_bar)
+    if shortEntry
+        alert("🔴 SELL " + tick + " @ " + str.tostring(close, format.mintick) +
+             " | T1 " + str.tostring(t1, format.mintick) + " · T2 " + str.tostring(t2, format.mintick) +
+             " | stop " + str.tostring(trail, format.mintick), alert.freq_once_per_bar)
+    if t1HitNow
+        alert("🎯 " + tick + ": T1 reached @ " + str.tostring(t1, format.mintick) +
+             " — consider taking partial profit", alert.freq_once_per_bar)
+    if t2HitNow
+        alert("🎯🎯 " + tick + ": stretch target T2 reached @ " + str.tostring(t2, format.mintick) +
+             " — consider closing the position", alert.freq_once_per_bar)
+    if protWarnNow
+        peakPct = dir == 1 ? (extremeSinceEntry / entryPrice - 1) * 100 : (entryPrice - extremeSinceEntry) / entryPrice * 100
+        nowPct  = dir == 1 ? (close / entryPrice - 1) * 100 : (entryPrice - close) / entryPrice * 100
+        alert("⚠️ " + tick + ": giving back gains — peaked +" + str.format("{0,number,#.#}", peakPct) +
+             "%, now " + str.format("{0,number,#.#}", nowPct) + "%. Consider protecting profit.", alert.freq_once_per_bar)
+    if longExit or shortExit
+        alert("✖ " + tick + ": " + (longExit ? "LONG" : "SHORT") + " signal closed @ " + str.tostring(close, format.mintick) +
+             " (" + (exitPnl >= 0 ? "+" : "") + str.format("{0,number,#.##}", exitPnl) + "%) — trailing stop flipped", alert.freq_once_per_bar)
+
+// Static conditions, if you prefer separate alerts per event type
+alertcondition(longEntry,  "BUY signal",  "IREN Signal Pro V2: BUY — targets & hold time on chart")
+alertcondition(shortEntry, "SELL signal", "IREN Signal Pro V2: SELL — targets & hold time on chart")
+alertcondition(t1HitNow,   "T1 reached",  "IREN Signal Pro V2: high-probability target T1 reached — consider taking partial profit")
+alertcondition(t2HitNow,   "T2 reached",  "IREN Signal Pro V2: stretch target T2 reached — consider closing")
+alertcondition(protWarnNow, "Profit-protection warning", "IREN Signal Pro V2: position giving back gains — consider protecting profit")
+alertcondition(longExit or shortExit, "Signal exit", "IREN Signal Pro V2: trailing stop flipped — signal closed")
