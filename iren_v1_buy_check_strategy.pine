@@ -1,0 +1,157 @@
+//@version=5
+// ─────────────────────────────────────────────────────────────────────────────
+// IREN V1 Buy Check — audits every BUY signal of iren_signal_pro.pine (V1)
+//
+// Purpose: run V1's exact engine over historical data, LONGS ONLY, and
+// produce a row-by-row check of every buy signal.
+//
+// How to read the results (Strategy Tester tab at the bottom):
+//   • "List of Trades"  → one row per BUY signal: entry date/time, entry
+//     price, exit date/price, P&L. The exit comment tells the story of each
+//     trade, e.g. "T1✓ T2✓ 14 bars" or "no target, 6 bars".
+//   • "Overview"        → total P&L, profit factor, max drawdown.
+//   • The on-chart panel adds what the tester can't know: how often T1 and
+//     T2 were reached before the signal closed.
+//
+// Faithful to V1: ATR(10)×1.8 trailing flip engine, EMA9/21 + RSI + volume
+// confirmations (min 2 of 3), adaptive momentum targets, exit ONLY when the
+// trailing stop flips (close-based). No V2 filters, no stops, no partials —
+// exactly what following every V1 BUY label would have done.
+// Costs included: 0.03% commission + 2 ticks slippage per side.
+//
+// Usage: open NASDAQ:IREN, set the chart to 5 minutes, add this strategy.
+// (Note: TradingView limits how far back intraday history goes on your plan;
+// the date range shown in the Tester header tells you what was covered.)
+// ─────────────────────────────────────────────────────────────────────────────
+strategy("IREN V1 Buy Check — audit of every V1 BUY signal",
+     shorttitle = "V1 Buy Check",
+     overlay = true,
+     initial_capital = 10000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 95,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.03,
+     slippage = 2,
+     process_orders_on_close = true)
+
+// ── V1 inputs (defaults exactly as in iren_signal_pro.pine) ─────────────────
+grpSig = "V1 signal engine"
+atrLen     = input.int(10,   "ATR length",                       minval = 1, group = grpSig)
+atrMult    = input.float(1.8,"ATR sensitivity (trailing stop)",  minval = 0.1, step = 0.1, group = grpSig)
+minScore   = input.int(2,    "Min confirmations required (0–3)", minval = 0, maxval = 3, group = grpSig)
+emaFastLen = input.int(9,    "Fast EMA",  group = grpSig)
+emaSlowLen = input.int(21,   "Slow EMA",  group = grpSig)
+rsiLen     = input.int(14,   "RSI length", group = grpSig)
+volLen     = input.int(20,   "Volume average length", group = grpSig)
+volMult    = input.float(1.0,"Volume must exceed × average", step = 0.1, group = grpSig)
+
+grpTgt = "V1 targets (tracked for the audit)"
+t1Mult = input.float(1.0, "T1 (× ATR)", step = 0.1, group = grpTgt)
+t2Mult = input.float(2.2, "T2 (× ATR)", step = 0.1, group = grpTgt)
+adaptTargets = input.bool(true, "Adaptive targets", group = grpTgt)
+adaptSpeed   = input.float(0.25, "Adaptation speed", minval = 0.05, maxval = 1, step = 0.05, group = grpTgt)
+
+// ── Engine (V1) ──────────────────────────────────────────────────────────────
+atrVal = ta.atr(atrLen)
+emaF   = ta.ema(close, emaFastLen)
+emaS   = ta.ema(close, emaSlowLen)
+rsiVal = ta.rsi(close, rsiLen)
+volAvg = ta.sma(volume, volLen)
+
+nLoss = atrMult * atrVal
+var float trail = na
+trail := close > nz(trail[1]) and close[1] > nz(trail[1]) ? math.max(nz(trail[1]), close - nLoss) :
+     close < nz(trail[1]) and close[1] < nz(trail[1]) ? math.min(nz(trail[1]), close + nLoss) :
+     close > nz(trail[1]) ? close - nLoss : close + nLoss
+
+var int posState = 0
+posState := close > trail ? 1 : close < trail ? -1 : nz(posState[1])
+baseSell = ta.crossunder(close, trail)
+
+volOk     = not na(volAvg) and volume > volAvg * volMult
+scoreLong = (emaF > emaS ? 1 : 0) + (rsiVal > 50 ? 1 : 0) + (volOk ? 1 : 0)
+longOk    = scoreLong >= minScore
+barOk     = barstate.isconfirmed
+
+// Momentum strength for adaptive targets (V1)
+f_clamp01(float x) =>
+    math.max(0.0, math.min(1.0, x))
+volRatio = na(volAvg) or volAvg == 0 ? 1.0 : volume / volAvg
+strLong  = (f_clamp01((rsiVal - 50) / 25) + f_clamp01((emaF - emaS) / atrVal) + f_clamp01((volRatio - 0.8) / 1.2)) / 3
+f_t1Factor(float s) => 0.7 + 0.6 * s
+f_t2Factor(float s) => 0.6 + 0.9 * s
+
+// ── Trade state & audit counters ─────────────────────────────────────────────
+var int   dir      = 0
+var float entryPrice = na
+var int   entryBar = na
+var float t1       = na
+var float t2       = na
+var bool  t1Hit    = false
+var bool  t2Hit    = false
+var int   nBuys    = 0
+var int   nT1      = 0
+var int   nT2      = 0
+var float sumBars  = 0.0
+
+// Adapt open targets (V1 behavior)
+if adaptTargets and dir == 1 and bar_index > entryBar
+    if not t1Hit
+        newT1 = entryPrice + t1Mult * f_t1Factor(strLong) * atrVal
+        t1 := t1 + (newT1 - t1) * adaptSpeed
+    if not t2Hit
+        newT2 = entryPrice + t2Mult * f_t2Factor(strLong) * atrVal
+        t2 := t2 + (newT2 - t2) * adaptSpeed
+        t2 := math.max(t2, t1 + 0.3 * atrVal)
+
+// Track target hits
+if dir == 1 and bar_index > entryBar
+    if not t1Hit and high >= t1
+        t1Hit := true
+    if not t2Hit and high >= t2
+        t2Hit := true
+
+// Exit: V1 closes a BUY only when the trailing stop flips (bar close)
+if dir == 1 and baseSell and barOk
+    held = bar_index - entryBar
+    nT1 += t1Hit ? 1 : 0
+    nT2 += t2Hit ? 1 : 0
+    sumBars += held
+    strategy.close("Buy", comment = (t1Hit ? "T1✓ " : "") + (t2Hit ? "T2✓ " : "") +
+         (not t1Hit and not t2Hit ? "no target, " : "") + str.tostring(held) + " bars")
+    dir := 0
+
+// Entry: V1 buy — bullish side of the trail + confirmations (min 2 of 3)
+buySignal = dir != 1 and posState == 1 and longOk and barOk
+if buySignal
+    dir := 1
+    entryPrice := close
+    entryBar := bar_index
+    t1 := close + t1Mult * (adaptTargets ? f_t1Factor(strLong) : 1.0) * atrVal
+    t2 := close + t2Mult * (adaptTargets ? f_t2Factor(strLong) : 1.0) * atrVal
+    t1Hit := false
+    t2Hit := false
+    nBuys += 1
+    strategy.entry("Buy", strategy.long, comment = "BUY " + (scoreLong >= 3 ? "A+" : "B"))
+
+// ── Visuals & audit summary ──────────────────────────────────────────────────
+colBull = color.new(#089981, 0)
+colBear = color.new(#f23645, 0)
+plot(bar_index > atrLen ? trail : na, "ATR trailing stop", color = posState == 1 ? colBull : colBear, linewidth = 2)
+plot(dir == 1 ? t1 : na, "T1", color = color.new(#26c281, 40), style = plot.style_linebr)
+plot(dir == 1 ? t2 : na, "T2", color = color.new(#00bcd4, 40), style = plot.style_linebr)
+
+var table tbl = table.new(position.top_right, 2, 6, border_width = 1,
+     border_color = color.new(color.gray, 70), frame_width = 1,
+     frame_color = color.new(color.gray, 50), bgcolor = color.new(color.black, 25))
+f_cell(int row, string k, string v) =>
+    table.cell(tbl, 0, row, k, text_color = color.new(color.white, 30), text_size = size.small, text_halign = text.align_left)
+    table.cell(tbl, 1, row, v, text_color = color.white, text_size = size.small, text_halign = text.align_right)
+if barstate.islast
+    table.cell(tbl, 0, 0, "V1 BUY AUDIT", text_color = color.white, text_size = size.small, text_halign = text.align_left)
+    table.cell(tbl, 1, 0, timeframe.period + (timeframe.isintraday ? "m" : ""), text_color = color.new(color.white, 40), text_size = size.small, text_halign = text.align_right)
+    f_cell(1, "Buy signals", str.tostring(nBuys))
+    f_cell(2, "Reached T1", nBuys > 0 ? str.format("{0,number,#.#}%", 100.0 * nT1 / nBuys) : "—")
+    f_cell(3, "Reached T2", nBuys > 0 ? str.format("{0,number,#.#}%", 100.0 * nT2 / nBuys) : "—")
+    f_cell(4, "Avg bars held", nBuys > 0 ? str.format("{0,number,#.#}", sumBars / nBuys) : "—")
+    f_cell(5, "P&L / trade list", "see Strategy Tester ↓")
