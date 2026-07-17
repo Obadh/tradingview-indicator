@@ -80,6 +80,8 @@ takeT1    = input.bool(true, "Take partial profit at T1", group = grpTgt)
 t1QtyPct  = input.int(50, "…partial size (% of position)", minval = 10, maxval = 90, step = 10, group = grpTgt)
 useLock   = input.bool(true, "Profit-lock exit after T2", group = grpTgt)
 lockTight = input.float(1.0, "…tightened stop distance (× ATR from peak)", minval = 0.2, step = 0.1, group = grpTgt)
+useStopOrders = input.bool(true, "Intrabar stop orders at the trailing level", group = grpTgt,
+     tooltip = "On (default): a real stop order rides the trailing level, so a loss is cut the moment price touches it — losses stay close to the promised stop distance. Off: exits only when a bar CLOSES beyond the trailing stop (like the indicator's signals), which lets fast moves run losses well past the stop.")
 
 // ── Core series (identical to the V2 indicator) ─────────────────────────────
 atrVal  = ta.atr(atrLen)
@@ -151,6 +153,12 @@ var bool  t2Hit      = false
 var float extremeSinceEntry = na
 var int   lastEntryBar = na
 var int   lockExitDir  = 0
+
+// ── 0a. Sync after an intrabar stop-out ──────────────────────────────────────
+// A stop order can flatten the position mid-bar; fold that back into the
+// signal state so the engine doesn't think it is still in a trade.
+if dir != 0 and bar_index > entryBar and strategy.position_size == 0
+    dir := 0
 
 // ── 0. Adapt the open targets ────────────────────────────────────────────────
 if adaptTargets and dir != 0 and bar_index > entryBar
@@ -227,11 +235,21 @@ if shortEntry
     extremeSinceEntry := close
     strategy.entry("Short", strategy.short)
 
-// ── 4. Partial profit at T1 (limit order, fills intrabar) ───────────────────
-if takeT1 and dir == 1 and not t1Hit
-    strategy.exit("T1", from_entry = "Long", qty_percent = t1QtyPct, limit = t1)
-if takeT1 and dir == -1 and not t1Hit
-    strategy.exit("T1", from_entry = "Short", qty_percent = t1QtyPct, limit = t1)
+// ── 4. Working orders: partial profit at T1, intrabar protective stop ───────
+// Both fill intrabar. The stop rides the trailing level (or the tightened
+// profit-lock level after T2), capping each loss near its promised size.
+effStopL = useLock and t2Hit and dir == 1 ? math.max(trail, extremeSinceEntry - lockTight * atrVal) : trail
+effStopS = useLock and t2Hit and dir == -1 ? math.min(trail, extremeSinceEntry + lockTight * atrVal) : trail
+if dir == 1
+    if takeT1 and not t1Hit
+        strategy.exit("T1", from_entry = "Long", qty_percent = t1QtyPct, limit = t1)
+    if useStopOrders
+        strategy.exit("SL", from_entry = "Long", stop = effStopL)
+if dir == -1
+    if takeT1 and not t1Hit
+        strategy.exit("T1", from_entry = "Short", qty_percent = t1QtyPct, limit = t1)
+    if useStopOrders
+        strategy.exit("SL", from_entry = "Short", stop = effStopS)
 
 // ── 5. Minimal visuals ───────────────────────────────────────────────────────
 colBull = color.new(#089981, 0)
