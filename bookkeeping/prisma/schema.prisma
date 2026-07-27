@@ -1,0 +1,1187 @@
+// Prisma schema for the eenmanszaak bookkeeping application.
+//
+// Design principles (see docs/ARCHITECTURE.md):
+// - All monetary amounts are integer euro cents (Int). Never floating point.
+// - Percentages are stored as basis points (Int, 0..10000) for exactness.
+// - Exchange rates are exact decimals (Decimal 20,10).
+// - Business dates are DATE columns interpreted in Europe/Amsterdam;
+//   system timestamps are timestamptz (UTC).
+// - Every domain row carries businessId for future multi-company support.
+// - Financial records are never hard-deleted: they are voided/corrected and
+//   audit-logged. Soft deletion (deletedAt) applies only to non-financial
+//   auxiliary records (contacts, saved filters, reminders ...).
+// - AuditLog is append-only; the application exposes no update/delete path.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ---------------------------------------------------------------------------
+// Identity & access
+// ---------------------------------------------------------------------------
+
+model User {
+  id                  String    @id @default(uuid()) @db.Uuid
+  email               String    @unique
+  name                String?
+  // bcrypt hash; null when the user only uses another factor (future).
+  passwordHash        String?
+  // AES-256-GCM encrypted TOTP secret (see src/lib/crypto.ts); null = MFA off.
+  totpSecretEncrypted String?
+  totpEnabledAt       DateTime?
+  emailVerifiedAt     DateTime?
+  createdAt           DateTime  @default(now())
+  updatedAt           DateTime  @updatedAt
+  deletedAt           DateTime?
+
+  memberships    Membership[]
+  auditLogs      AuditLog[]
+  documents      Document[]      @relation("uploadedBy")
+  exportJobs     ExportJob[]
+  timeEntries    TimeEntry[]
+  savedFilters   SavedFilter[]
+  loginAttempts  LoginAttempt[]
+}
+
+/// Future-proofing: a user can belong to several businesses (owner now,
+/// accountant/read-only later). V1 always creates exactly one OWNER membership.
+model Membership {
+  id         String         @id @default(uuid()) @db.Uuid
+  userId     String         @db.Uuid
+  businessId String         @db.Uuid
+  role       MembershipRole @default(OWNER)
+  createdAt  DateTime       @default(now())
+
+  user     User     @relation(fields: [userId], references: [id])
+  business Business @relation(fields: [businessId], references: [id])
+
+  @@unique([userId, businessId])
+  @@index([businessId])
+}
+
+enum MembershipRole {
+  OWNER
+  ACCOUNTANT // reserved for later; read/annotate access
+  READONLY   // reserved for later
+}
+
+/// Persisted login attempts back rate limiting and lockout across restarts.
+model LoginAttempt {
+  id        String   @id @default(uuid()) @db.Uuid
+  email     String
+  userId    String?  @db.Uuid
+  ipHash    String // SHA-256 of IP, never the raw address
+  success   Boolean
+  createdAt DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([email, createdAt])
+  @@index([ipHash, createdAt])
+}
+
+// ---------------------------------------------------------------------------
+// Business profile
+// ---------------------------------------------------------------------------
+
+model Business {
+  id        String  @id @default(uuid()) @db.Uuid
+  legalName String
+  tradeName String?
+  kvkNumber String? // 8 digits; null until registered
+  /// EU VAT identification number (NL123456789B01) — shown masked by default.
+  vatId     String?
+  /// Omzetbelastingnummer — stored AES-256-GCM encrypted, always masked in UI.
+  obNumberEncrypted String?
+  addressLine1 String?
+  addressLine2 String?
+  postalCode   String?
+  city         String?
+  country      String  @default("NL")
+  email        String?
+  phone        String?
+  iban         String? // default bank details printed on sales invoices
+  bic          String?
+  /// Date of KVK registration; used to flag pre-registration expenses.
+  kvkRegisteredOn DateTime? @db.Date
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+  deletedAt DateTime?
+
+  settings            BusinessSettings?
+  memberships         Membership[]
+  contacts            Contact[]
+  transactions        Transaction[]
+  documents           Document[]
+  invoices            Invoice[]
+  payments            Payment[]
+  bankAccounts        BankAccount[]
+  bankImports         BankStatementImport[]
+  bankTransactions    BankTransaction[]
+  vatCodes            VATCode[]
+  categories          Category[]
+  ledgerAccounts      LedgerAccount[]
+  assets              Asset[]
+  taxPeriods          TaxPeriod[]
+  auditLogs           AuditLog[]
+  exportJobs          ExportJob[]
+  reminders           Reminder[]
+  appSettings         AppSetting[]
+  invoiceSequences    InvoiceSequence[]
+  projects            Project[]
+  timeEntries         TimeEntry[]
+  officialLetters     OfficialLetter[]
+  savedFilters        SavedFilter[]
+  reconciliationMatches ReconciliationMatch[]
+  paymentAllocations  PaymentAllocation[]
+}
+
+enum VatFilingFrequency {
+  MONTHLY
+  QUARTERLY
+  YEARLY
+  UNKNOWN
+}
+
+enum KorStatus {
+  NOT_ENROLLED
+  ENROLLED
+  PENDING
+  UNKNOWN
+}
+
+enum AccountingBasis {
+  /// Kasstelsel — record on payment date. Common for small eenmanszaken.
+  CASH
+  /// Factuurstelsel — record on invoice date. Default assumption.
+  INVOICE
+  UNKNOWN
+}
+
+enum BankUsage {
+  PERSONAL_ONLY
+  BUSINESS_ONLY
+  BOTH
+}
+
+model BusinessSettings {
+  id         String @id @default(uuid()) @db.Uuid
+  businessId String @unique @db.Uuid
+
+  invoicePrefix      String             @default("INV")
+  firstFinancialYear Int?
+  vatFilingFrequency VatFilingFrequency @default(UNKNOWN)
+  korStatus          KorStatus          @default(UNKNOWN)
+  accountingBasis    AccountingBasis    @default(UNKNOWN)
+  bankUsage          BankUsage          @default(BOTH)
+  defaultPaymentTermDays Int            @default(30)
+  /// Bookkeeping retention in years. Dutch default: 7.
+  retentionYears     Int                @default(7)
+  /// Suggest treating purchases at/above this amount as assets (configurable rule).
+  assetThresholdCents Int               @default(45000)
+  /// Explicit consent flags — external processing is opt-in only.
+  ocrProviderEnabled  Boolean           @default(false)
+  ocrProviderName     String?
+  ocrConsentAt        DateTime?
+  onboardingCompletedAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  business Business @relation(fields: [businessId], references: [id])
+}
+
+/// Free-form per-business (or global, businessId null) key/value settings.
+model AppSetting {
+  id         String  @id @default(uuid()) @db.Uuid
+  businessId String? @db.Uuid
+  key        String
+  value      Json
+  updatedAt  DateTime @updatedAt
+
+  business Business? @relation(fields: [businessId], references: [id])
+
+  @@unique([businessId, key])
+}
+
+// ---------------------------------------------------------------------------
+// Chart of accounts & double-entry core
+// ---------------------------------------------------------------------------
+
+enum LedgerAccountType {
+  ASSET
+  LIABILITY
+  EQUITY
+  REVENUE
+  EXPENSE
+}
+
+model LedgerAccount {
+  id         String            @id @default(uuid()) @db.Uuid
+  businessId String            @db.Uuid
+  code       String // e.g. "1010"
+  name       String
+  type       LedgerAccountType
+  /// System accounts (bank, VAT, owner equity...) cannot be deleted or retyped.
+  isSystem   Boolean           @default(false)
+  /// Stable key for programmatic lookup, e.g. "bank", "output_vat_high".
+  systemKey  String?
+  createdAt  DateTime          @default(now())
+  updatedAt  DateTime          @updatedAt
+  deletedAt  DateTime?
+
+  business     Business          @relation(fields: [businessId], references: [id])
+  lines        TransactionLine[]
+  categories   Category[]
+  bankAccounts BankAccount[]
+
+  @@unique([businessId, code])
+  @@unique([businessId, systemKey])
+}
+
+enum TransactionType {
+  BUSINESS_INCOME
+  BUSINESS_EXPENSE
+  OWNER_CONTRIBUTION // private deposit — never profit
+  OWNER_WITHDRAWAL   // private withdrawal — never an expense
+  OWN_TRANSFER       // between the user's own accounts — never income/expense
+  REFUND_RECEIVED
+  REFUND_PAID
+  TAX_PAYMENT
+  VAT_REFUND
+  DEPRECIATION
+  CORRECTION // explicit correction of a locked/confirmed record
+  UNKNOWN
+}
+
+enum TransactionStatus {
+  DRAFT
+  NEEDS_REVIEW
+  CONFIRMED
+  RECONCILED
+  LOCKED
+  CORRECTED // superseded by a correction entry; kept for the audit trail
+  VOID
+}
+
+enum ReviewFlag {
+  NONE
+  NEEDS_TAX_REVIEW // uncertain international / deductibility questions
+  NEEDS_ADVICE     // user explicitly asked for professional advice
+}
+
+/// A Transaction is one financial event (an expense, an income, an owner
+/// transfer, a depreciation charge, a correction...). Its TransactionLines
+/// are the balanced double-entry journal. A transaction may only reach
+/// CONFIRMED/RECONCILED/LOCKED status when sum(debit) == sum(credit) —
+/// enforced in src/lib/domain/journal.ts and covered by tests.
+model Transaction {
+  id         String            @id @default(uuid()) @db.Uuid
+  businessId String            @db.Uuid
+  type       TransactionType   @default(UNKNOWN)
+  status     TransactionStatus @default(DRAFT)
+  reviewFlag ReviewFlag        @default(NONE)
+
+  /// Business date (invoice date for invoice basis, payment date for cash basis).
+  date        DateTime  @db.Date
+  description String
+  notes       String?
+
+  contactId  String? @db.Uuid
+  categoryId String? @db.Uuid
+
+  currency String @default("EUR")
+  /// Total in original currency (cents of that currency), if not EUR.
+  originalAmountCents Int?
+  /// Exchange rate used for EUR conversion (1 unit foreign = rate EUR).
+  exchangeRate     Decimal? @db.Decimal(20, 10)
+  exchangeRateSource String? // e.g. "ECB", "bank statement", "manual"
+  exchangeRateDate DateTime? @db.Date
+  exchangeRateNote String? // required explanation for manual overrides
+
+  /// EUR totals, in cents. amountCents is gross (incl. VAT) for the event.
+  amountCents    Int
+  vatAmountCents Int @default(0)
+
+  invoiceNumber String?
+  invoiceDate   DateTime? @db.Date
+  deliveryDate  DateTime? @db.Date
+  dueDate       DateTime? @db.Date
+  paymentDate   DateTime? @db.Date
+  paymentMethod String?
+  isPaid        Boolean   @default(false)
+  /// Paid from private funds (owner contribution in kind) vs business account.
+  paidPersonally Boolean  @default(false)
+
+  /// Expense made before KVK registration; flagged, never auto-deducted.
+  isPreRegistration Boolean @default(false)
+  /// Mixed business/private use.
+  isMixedUse       Boolean @default(false)
+  businessUseBp    Int     @default(10000) // basis points, 10000 = 100%
+  vatRecoveryBp    Int     @default(10000)
+  itDeductibleBp   Int     @default(10000)
+  mixedUseNote     String? // required when any of the above < 10000
+  businessPurpose  String?
+
+  supplierCountry String?
+  supplierVatId   String?
+  isReverseCharge Boolean @default(false)
+
+  customerType CustomerType?
+  paymentReference String?
+
+  taxPeriodId           String? @db.Uuid
+  correctsTransactionId String? @db.Uuid
+  finalizedAt           DateTime?
+  createdAt             DateTime  @default(now())
+  updatedAt             DateTime  @updatedAt
+
+  business   Business       @relation(fields: [businessId], references: [id])
+  contact    Contact?       @relation(fields: [contactId], references: [id])
+  category   Category?      @relation(fields: [categoryId], references: [id])
+  taxPeriod  TaxPeriod?     @relation(fields: [taxPeriodId], references: [id])
+  corrects   Transaction?   @relation("corrections", fields: [correctsTransactionId], references: [id])
+  correctedBy Transaction[] @relation("corrections")
+
+  lines           TransactionLine[]
+  documentLinks   DocumentLink[]
+  payments        PaymentAllocation[]
+  reconciliations ReconciliationMatch[]
+  asset           Asset?              @relation("assetPurchase")
+  invoice         Invoice?            @relation("invoiceTransaction")
+
+  @@index([businessId, date])
+  @@index([businessId, status])
+  @@index([businessId, type])
+  @@index([taxPeriodId])
+}
+
+enum CustomerType {
+  BUSINESS
+  CONSUMER
+  PLATFORM
+  UNKNOWN
+}
+
+/// One balanced journal line. Exactly one of debitCents/creditCents is > 0.
+/// Item-level detail (description, quantity, VAT code) lives here too, so a
+/// multi-rate purchase invoice is simply several expense lines with different
+/// VAT codes plus their VAT lines and one counter (bank/payable) line.
+model TransactionLine {
+  id              String  @id @default(uuid()) @db.Uuid
+  transactionId   String  @db.Uuid
+  ledgerAccountId String  @db.Uuid
+  description     String?
+  debitCents      Int     @default(0)
+  creditCents     Int     @default(0)
+  vatCodeId       String? @db.Uuid
+  /// Net base amount this line's VAT was computed from (for VAT reports).
+  vatBaseCents    Int?
+  quantity        Decimal? @db.Decimal(12, 3)
+  sortOrder       Int      @default(0)
+
+  transaction   Transaction   @relation(fields: [transactionId], references: [id])
+  ledgerAccount LedgerAccount @relation(fields: [ledgerAccountId], references: [id])
+  vatCode       VATCode?      @relation(fields: [vatCodeId], references: [id])
+
+  @@index([transactionId])
+  @@index([ledgerAccountId])
+}
+
+// ---------------------------------------------------------------------------
+// VAT
+// ---------------------------------------------------------------------------
+
+enum VatTreatment {
+  DOMESTIC_HIGH      // 21%
+  DOMESTIC_LOW       // 9%
+  DOMESTIC_ZERO      // 0%
+  EXEMPT
+  OUTSIDE_SCOPE
+  REVERSE_CHARGE_SALE     // sale where VAT shifted to customer
+  REVERSE_CHARGE_PURCHASE // purchase where VAT shifted to us (e.g. NL builder)
+  EU_ACQUISITION     // EU goods purchase
+  EU_SERVICE         // EU B2B service purchase (art. 196 reverse charge)
+  IMPORT             // non-EU import VAT
+  FOREIGN_VAT        // foreign VAT charged — NOT recoverable as Dutch input VAT
+  UNKNOWN
+}
+
+/// Versioned VAT codes. Rates/treatments are data, not hardcoded UI logic.
+/// A rate change is a new row with a new validFrom; old rows stay for history.
+model VATCode {
+  id          String       @id @default(uuid()) @db.Uuid
+  businessId  String       @db.Uuid
+  code        String // "NL21", "NL9", "EU-SRV", ...
+  name        String
+  treatment   VatTreatment
+  ratePermille Int         @default(0) // 210 = 21.0%
+  /// Dutch VAT return box this maps to, e.g. "1a", "4b", "5b". Null = none.
+  returnBox   String?
+  /// Box for the reverse-charge input side (e.g. EU services: 4b + 5b input).
+  inputReturnBox String?
+  rulesVersion Int         @default(1)
+  validFrom   DateTime     @db.Date
+  validTo     DateTime?    @db.Date
+  createdAt   DateTime     @default(now())
+
+  business Business          @relation(fields: [businessId], references: [id])
+  lines    TransactionLine[]
+  invoiceLines InvoiceLine[]
+  categories   Category[]
+
+  @@unique([businessId, code, rulesVersion])
+  @@index([businessId, treatment])
+}
+
+enum TaxPeriodType {
+  VAT
+  INCOME_TAX_YEAR
+}
+
+enum TaxPeriodStatus {
+  NOT_PREPARED
+  IN_PROGRESS
+  READY_FOR_REVIEW
+  FILED_MANUALLY
+  CORRECTED
+}
+
+model TaxPeriod {
+  id         String          @id @default(uuid()) @db.Uuid
+  businessId String          @db.Uuid
+  type       TaxPeriodType   @default(VAT)
+  year       Int
+  /// 1..12 for monthly, 1..4 for quarterly, 0 for yearly.
+  periodNo   Int
+  startDate  DateTime        @db.Date
+  endDate    DateTime        @db.Date
+  status     TaxPeriodStatus @default(NOT_PREPARED)
+  /// Locked after manual filing; changes then require CORRECTION transactions.
+  lockedAt   DateTime?
+  filedAt    DateTime?
+  /// Snapshot of the preparation summary at filing time (JSON).
+  filedSnapshot Json?
+  notes      String?
+  createdAt  DateTime        @default(now())
+  updatedAt  DateTime        @updatedAt
+
+  business     Business      @relation(fields: [businessId], references: [id])
+  transactions Transaction[]
+  reminders    Reminder[]
+
+  @@unique([businessId, type, year, periodNo])
+}
+
+// ---------------------------------------------------------------------------
+// Contacts
+// ---------------------------------------------------------------------------
+
+enum ContactKind {
+  SUPPLIER
+  CUSTOMER
+  PLATFORM
+  AUTHORITY
+  OTHER
+}
+
+model Contact {
+  id         String      @id @default(uuid()) @db.Uuid
+  businessId String      @db.Uuid
+  kind       ContactKind @default(OTHER)
+  name       String
+  legalName  String?
+  vatId      String?
+  kvkNumber  String?
+  addressLine1 String?
+  addressLine2 String?
+  postalCode String?
+  city       String?
+  country    String  @default("NL")
+  email      String?
+  phone      String?
+  iban       String?
+  defaultCategoryId String? @db.Uuid
+  notes      String?
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  deletedAt  DateTime?
+
+  business     Business      @relation(fields: [businessId], references: [id])
+  transactions Transaction[]
+  invoices     Invoice[]
+  letters      OfficialLetter[]
+
+  @@index([businessId, name])
+}
+
+// ---------------------------------------------------------------------------
+// Categories
+// ---------------------------------------------------------------------------
+
+enum CategoryKind {
+  INCOME
+  EXPENSE
+}
+
+model Category {
+  id         String       @id @default(uuid()) @db.Uuid
+  businessId String       @db.Uuid
+  kind       CategoryKind
+  name       String
+  description String?
+  /// Default ledger account for entries in this category.
+  ledgerAccountId String? @db.Uuid
+  /// Default VAT code suggestion (always user-confirmable).
+  defaultVatCodeId String? @db.Uuid
+  /// Suggest asset treatment for purchases in this category above threshold.
+  suggestAsset Boolean    @default(false)
+  isSystem   Boolean      @default(false)
+  sortOrder  Int          @default(0)
+  createdAt  DateTime     @default(now())
+  updatedAt  DateTime     @updatedAt
+  deletedAt  DateTime?
+
+  business      Business       @relation(fields: [businessId], references: [id])
+  ledgerAccount LedgerAccount? @relation(fields: [ledgerAccountId], references: [id])
+  defaultVatCode VATCode?      @relation(fields: [defaultVatCodeId], references: [id])
+  transactions  Transaction[]
+
+  @@unique([businessId, kind, name])
+}
+
+// ---------------------------------------------------------------------------
+// Documents
+// ---------------------------------------------------------------------------
+
+enum DocumentCategory {
+  PURCHASE_INVOICE
+  SALES_INVOICE
+  RECEIPT
+  BANK_STATEMENT
+  KVK_DOCUMENT
+  BELASTINGDIENST_LETTER
+  CONTRACT
+  SUBSCRIPTION_INVOICE
+  APP_STORE_STATEMENT
+  PAYMENT_PROVIDER_STATEMENT
+  OTHER
+}
+
+enum DocumentStatus {
+  UPLOADED
+  PROCESSING
+  NEEDS_REVIEW
+  CONFIRMED
+  ARCHIVED
+}
+
+model Document {
+  id         String           @id @default(uuid()) @db.Uuid
+  businessId String           @db.Uuid
+  category   DocumentCategory @default(OTHER)
+  status     DocumentStatus   @default(UPLOADED)
+
+  originalFilename String
+  mimeType         String
+  sizeBytes        Int
+  /// SHA-256 hex of the original bytes. Duplicate detection + integrity checks.
+  sha256           String
+  storageKey       String @unique
+  uploadedById     String @db.Uuid
+  uploadedAt       DateTime @default(now())
+  /// User confirmed an intentional duplicate upload of an existing checksum.
+  duplicateConfirmed Boolean @default(false)
+
+  documentDate DateTime? @db.Date
+  title        String?
+  notes        String?
+
+  /// OCR/AI suggestions. NEVER copied into accounting fields without user
+  /// confirmation. { fields: { name: { value, confidence } }, provider, at }
+  extraction        Json?
+  extractionStatus  String? // "none" | "pending" | "suggested" | "confirmed" | "failed"
+
+  /// Retention: earliest date deletion may be considered (computed, advisory).
+  retentionEligibleAt DateTime? @db.Date
+  archivedAt DateTime?
+  deletedAt  DateTime? // only after explicit retention flow with audit record
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+
+  business   Business          @relation(fields: [businessId], references: [id])
+  uploadedBy User              @relation("uploadedBy", fields: [uploadedById], references: [id])
+  versions   DocumentVersion[]
+  links      DocumentLink[]
+  letters    OfficialLetter[]
+  bankImports BankStatementImport[]
+  invoices   Invoice[]
+
+  @@index([businessId, sha256])
+  @@index([businessId, category])
+  @@index([businessId, status])
+}
+
+/// Additive version history. Version 1 is always the untouched original file;
+/// later versions are derived files (e.g. a rendered preview) — the original
+/// storage object is never overwritten or replaced.
+model DocumentVersion {
+  id         String   @id @default(uuid()) @db.Uuid
+  documentId String   @db.Uuid
+  version    Int
+  storageKey String   @unique
+  mimeType   String
+  sizeBytes  Int
+  sha256     String
+  note       String? // e.g. "original upload", "generated preview"
+  createdAt  DateTime @default(now())
+
+  document Document @relation(fields: [documentId], references: [id])
+
+  @@unique([documentId, version])
+}
+
+/// Attach a document to any accounting record (transaction, invoice, asset...).
+model DocumentLink {
+  id            String   @id @default(uuid()) @db.Uuid
+  documentId    String   @db.Uuid
+  transactionId String?  @db.Uuid
+  invoiceId     String?  @db.Uuid
+  assetId       String?  @db.Uuid
+  paymentId     String?  @db.Uuid
+  createdAt     DateTime @default(now())
+
+  document    Document     @relation(fields: [documentId], references: [id])
+  transaction Transaction? @relation(fields: [transactionId], references: [id])
+  invoice     Invoice?     @relation(fields: [invoiceId], references: [id])
+  asset       Asset?       @relation(fields: [assetId], references: [id])
+  payment     Payment?     @relation(fields: [paymentId], references: [id])
+
+  @@index([documentId])
+  @@index([transactionId])
+  @@index([invoiceId])
+}
+
+// ---------------------------------------------------------------------------
+// Sales invoices
+// ---------------------------------------------------------------------------
+
+enum InvoiceStatus {
+  DRAFT
+  FINALIZED
+  SENT
+  PAID
+  PARTIALLY_PAID
+  OVERDUE
+  CREDITED
+  VOID
+}
+
+enum InvoiceKind {
+  INVOICE
+  CREDIT_NOTE
+}
+
+model Invoice {
+  id         String        @id @default(uuid()) @db.Uuid
+  businessId String        @db.Uuid
+  kind       InvoiceKind   @default(INVOICE)
+  status     InvoiceStatus @default(DRAFT)
+
+  /// Assigned only at finalization, from InvoiceSequence. Unique per business.
+  number     String?
+  prefix     String?
+  issueDate  DateTime? @db.Date
+  supplyDate DateTime? @db.Date
+  dueDate    DateTime? @db.Date
+
+  contactId  String @db.Uuid
+  /// Snapshot of customer details at finalization (immutable record).
+  customerSnapshot Json?
+  /// Snapshot of own business details at finalization.
+  businessSnapshot Json?
+
+  currency         String  @default("EUR")
+  totalExVatCents  Int     @default(0)
+  totalVatCents    Int     @default(0)
+  totalIncVatCents Int     @default(0)
+
+  paymentTermDays     Int     @default(30)
+  paymentInstructions String?
+  /// Set for intra-EU B2B reverse-charge: "Btw verlegd / VAT reverse charged".
+  reverseChargeWording String?
+  notes  String?
+
+  /// Credit note reference to the invoice it corrects.
+  creditsInvoiceId String? @db.Uuid
+  /// Finalized PDF document (preserved, never regenerated in place).
+  pdfDocumentId String? @db.Uuid
+  transactionId String? @unique @db.Uuid
+  finalizedAt DateTime?
+  sentAt      DateTime?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  business  Business  @relation(fields: [businessId], references: [id])
+  contact   Contact   @relation(fields: [contactId], references: [id])
+  creditsInvoice Invoice?  @relation("creditNotes", fields: [creditsInvoiceId], references: [id])
+  creditNotes    Invoice[] @relation("creditNotes")
+  pdfDocument    Document? @relation(fields: [pdfDocumentId], references: [id])
+  transaction    Transaction? @relation("invoiceTransaction", fields: [transactionId], references: [id])
+  lines       InvoiceLine[]
+  documentLinks DocumentLink[]
+  allocations PaymentAllocation[]
+
+  @@unique([businessId, number])
+  @@index([businessId, status])
+}
+
+model InvoiceLine {
+  id        String  @id @default(uuid()) @db.Uuid
+  invoiceId String  @db.Uuid
+  description String
+  quantity  Decimal @db.Decimal(12, 3)
+  unitPriceExVatCents Int
+  vatCodeId String? @db.Uuid
+  vatRatePermille Int @default(0)
+  lineExVatCents  Int
+  lineVatCents    Int
+  sortOrder Int @default(0)
+
+  invoice Invoice  @relation(fields: [invoiceId], references: [id])
+  vatCode VATCode? @relation(fields: [vatCodeId], references: [id])
+
+  @@index([invoiceId])
+}
+
+/// Gapless-intent sequential numbering per business+prefix+year.
+model InvoiceSequence {
+  id         String @id @default(uuid()) @db.Uuid
+  businessId String @db.Uuid
+  prefix     String
+  year       Int
+  nextNumber Int    @default(1)
+
+  business Business @relation(fields: [businessId], references: [id])
+
+  @@unique([businessId, prefix, year])
+}
+
+// ---------------------------------------------------------------------------
+// Payments, bank accounts, reconciliation
+// ---------------------------------------------------------------------------
+
+enum BankAccountKind {
+  BUSINESS
+  PERSONAL
+  CASH
+}
+
+model BankAccount {
+  id         String          @id @default(uuid()) @db.Uuid
+  businessId String          @db.Uuid
+  kind       BankAccountKind
+  name       String
+  iban       String?
+  bic        String?
+  currency   String          @default("EUR")
+  ledgerAccountId String?    @db.Uuid
+  /// For personal accounts: only business-related lines are retained by default.
+  retainOnlyBusinessLines Boolean @default(true)
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  deletedAt  DateTime?
+
+  business      Business       @relation(fields: [businessId], references: [id])
+  ledgerAccount LedgerAccount? @relation(fields: [ledgerAccountId], references: [id])
+  imports          BankStatementImport[]
+  bankTransactions BankTransaction[]
+  payments         Payment[]
+
+  @@index([businessId])
+}
+
+enum ImportStatus {
+  PENDING
+  MAPPING
+  IMPORTED
+  DISCARDED
+  FAILED
+}
+
+model BankStatementImport {
+  id            String       @id @default(uuid()) @db.Uuid
+  businessId    String       @db.Uuid
+  bankAccountId String       @db.Uuid
+  documentId    String?      @db.Uuid
+  format        String       @default("CSV") // CSV now; CAMT053/MT940 later
+  status        ImportStatus @default(PENDING)
+  /// Column mapping chosen in the wizard (JSON), reusable per bank.
+  columnMapping Json?
+  rowCount      Int          @default(0)
+  importedCount Int          @default(0)
+  duplicateCount Int         @default(0)
+  errorLog      Json?
+  createdAt     DateTime     @default(now())
+  updatedAt     DateTime     @updatedAt
+
+  business    Business    @relation(fields: [businessId], references: [id])
+  bankAccount BankAccount @relation(fields: [bankAccountId], references: [id])
+  document    Document?   @relation(fields: [documentId], references: [id])
+  bankTransactions BankTransaction[]
+}
+
+enum ReconciliationState {
+  UNMATCHED
+  SUGGESTED
+  PARTIALLY_MATCHED
+  MATCHED
+  IGNORED_PRIVATE
+  OWN_TRANSFER
+}
+
+/// One line from an imported bank statement. Immutable once imported except
+/// for its reconciliation state.
+model BankTransaction {
+  id            String              @id @default(uuid()) @db.Uuid
+  businessId    String              @db.Uuid
+  bankAccountId String              @db.Uuid
+  importId      String?             @db.Uuid
+  bookingDate   DateTime            @db.Date
+  valueDate     DateTime?           @db.Date
+  amountCents   Int // signed: negative = money out
+  currency      String              @default("EUR")
+  counterpartyName String?
+  counterpartyIban String?
+  description   String?
+  reference     String?
+  /// Dedup fingerprint: sha256(account|date|amount|counterparty|description).
+  fingerprint   String
+  state         ReconciliationState @default(UNMATCHED)
+  stateNote     String?
+  createdAt     DateTime            @default(now())
+  updatedAt     DateTime            @updatedAt
+
+  business    Business             @relation(fields: [businessId], references: [id])
+  bankAccount BankAccount          @relation(fields: [bankAccountId], references: [id])
+  import      BankStatementImport? @relation(fields: [importId], references: [id])
+  matches     ReconciliationMatch[]
+  payments    Payment[]
+
+  @@unique([bankAccountId, fingerprint])
+  @@index([businessId, state])
+  @@index([businessId, bookingDate])
+}
+
+/// Explainable link between a bank line and an accounting record. `reason`
+/// records why the match was made/suggested — matching is never a black box.
+model ReconciliationMatch {
+  id                String   @id @default(uuid()) @db.Uuid
+  businessId        String   @db.Uuid
+  bankTransactionId String   @db.Uuid
+  transactionId     String?  @db.Uuid
+  invoiceId         String?  @db.Uuid
+  amountCents       Int
+  /// "exact amount + IBAN", "manual", "invoice number in description", ...
+  reason            String
+  suggested         Boolean  @default(false)
+  confirmedAt       DateTime?
+  createdAt         DateTime @default(now())
+
+  business        Business        @relation(fields: [businessId], references: [id])
+  bankTransaction BankTransaction @relation(fields: [bankTransactionId], references: [id])
+  transaction     Transaction?    @relation(fields: [transactionId], references: [id])
+
+  @@index([bankTransactionId])
+  @@index([transactionId])
+}
+
+enum PaymentMethod {
+  BANK_TRANSFER
+  IDEAL
+  CARD
+  CASH
+  PLATFORM_SETTLEMENT
+  OTHER
+}
+
+/// A registered payment event (may cover several invoices; an invoice may be
+/// paid by several payments — via PaymentAllocation).
+model Payment {
+  id            String        @id @default(uuid()) @db.Uuid
+  businessId    String        @db.Uuid
+  bankAccountId String?       @db.Uuid
+  bankTransactionId String?   @db.Uuid
+  date          DateTime      @db.Date
+  amountCents   Int // signed: positive = received
+  currency      String        @default("EUR")
+  method        PaymentMethod @default(BANK_TRANSFER)
+  reference     String?
+  notes         String?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  business        Business         @relation(fields: [businessId], references: [id])
+  bankAccount     BankAccount?     @relation(fields: [bankAccountId], references: [id])
+  bankTransaction BankTransaction? @relation(fields: [bankTransactionId], references: [id])
+  allocations     PaymentAllocation[]
+  documentLinks   DocumentLink[]
+
+  @@index([businessId, date])
+}
+
+model PaymentAllocation {
+  id            String  @id @default(uuid()) @db.Uuid
+  businessId    String  @db.Uuid
+  paymentId     String  @db.Uuid
+  invoiceId     String? @db.Uuid
+  transactionId String? @db.Uuid
+  amountCents   Int
+  createdAt     DateTime @default(now())
+
+  business    Business     @relation(fields: [businessId], references: [id])
+  payment     Payment      @relation(fields: [paymentId], references: [id])
+  invoice     Invoice?     @relation(fields: [invoiceId], references: [id])
+  transaction Transaction? @relation(fields: [transactionId], references: [id])
+
+  @@index([paymentId])
+  @@index([invoiceId])
+  @@index([transactionId])
+}
+
+// ---------------------------------------------------------------------------
+// Assets & depreciation
+// ---------------------------------------------------------------------------
+
+enum DepreciationMethod {
+  STRAIGHT_LINE
+  NONE
+}
+
+model Asset {
+  id         String @id @default(uuid()) @db.Uuid
+  businessId String @db.Uuid
+  name       String
+  category   String?
+  purchaseDate DateTime  @db.Date
+  inUseDate    DateTime? @db.Date
+  purchasePriceExVatCents Int
+  vatCents     Int @default(0)
+  businessUseBp Int @default(10000)
+  depreciationMethod DepreciationMethod @default(STRAIGHT_LINE)
+  usefulLifeMonths   Int @default(60)
+  residualValueCents Int @default(0)
+  annualDepreciationCents Int?
+  disposedDate DateTime? @db.Date
+  disposalProceedsCents Int?
+  notes      String?
+  purchaseTransactionId String? @unique @db.Uuid
+  createdAt  DateTime  @default(now())
+  updatedAt  DateTime  @updatedAt
+  deletedAt  DateTime?
+
+  business Business @relation(fields: [businessId], references: [id])
+  purchaseTransaction Transaction? @relation("assetPurchase", fields: [purchaseTransactionId], references: [id])
+  documentLinks DocumentLink[]
+
+  @@index([businessId])
+}
+
+// ---------------------------------------------------------------------------
+// Time tracking
+// ---------------------------------------------------------------------------
+
+model Project {
+  id         String  @id @default(uuid()) @db.Uuid
+  businessId String  @db.Uuid
+  name       String
+  description String?
+  archivedAt DateTime?
+  createdAt  DateTime @default(now())
+
+  business Business    @relation(fields: [businessId], references: [id])
+  entries  TimeEntry[]
+
+  @@unique([businessId, name])
+}
+
+model TimeEntry {
+  id         String   @id @default(uuid()) @db.Uuid
+  businessId String   @db.Uuid
+  userId     String   @db.Uuid
+  projectId  String?  @db.Uuid
+  date       DateTime @db.Date
+  minutes    Int
+  description String?
+  activityType String? // "development", "admin", "acquisition", ...
+  evidenceNote String?
+  /// Running timer support: startedAt set while the timer runs.
+  startedAt  DateTime?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  deletedAt  DateTime?
+
+  business Business @relation(fields: [businessId], references: [id])
+  user     User     @relation(fields: [userId], references: [id])
+  project  Project? @relation(fields: [projectId], references: [id])
+
+  @@index([businessId, date])
+}
+
+// ---------------------------------------------------------------------------
+// Official correspondence (KVK / Belastingdienst)
+// ---------------------------------------------------------------------------
+
+enum LetterStatus {
+  NEW
+  ACTION_REQUIRED
+  IN_PROGRESS
+  DONE
+  ARCHIVED
+}
+
+model OfficialLetter {
+  id         String       @id @default(uuid()) @db.Uuid
+  businessId String       @db.Uuid
+  contactId  String?      @db.Uuid
+  documentId String?      @db.Uuid
+  sender     String // "Belastingdienst", "KVK", ...
+  letterDate DateTime?    @db.Date
+  referenceNumber String?
+  taxType    String?
+  period     String?
+  responseDeadline DateTime? @db.Date
+  actionRequired Boolean   @default(false)
+  status     LetterStatus @default(NEW)
+  notes      String?
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  deletedAt  DateTime?
+
+  business Business  @relation(fields: [businessId], references: [id])
+  contact  Contact?  @relation(fields: [contactId], references: [id])
+  document Document? @relation(fields: [documentId], references: [id])
+  reminders Reminder[]
+
+  @@index([businessId, status])
+}
+
+// ---------------------------------------------------------------------------
+// Reminders, export jobs, audit, search
+// ---------------------------------------------------------------------------
+
+enum ReminderKind {
+  VAT_RETURN_DUE
+  VAT_PAYMENT_DUE
+  INCOME_TAX_PREP
+  UNREVIEWED_ITEMS
+  MISSING_DOCUMENTS
+  UNRECONCILED_BANK
+  SUBSCRIPTION_EXPIRY
+  BACKUP
+  LETTER_DEADLINE
+  RETENTION_REVIEW
+  CUSTOM
+}
+
+enum ReminderStatus {
+  OPEN
+  DONE
+  DISMISSED
+}
+
+model Reminder {
+  id         String         @id @default(uuid()) @db.Uuid
+  businessId String         @db.Uuid
+  kind       ReminderKind   @default(CUSTOM)
+  status     ReminderStatus @default(OPEN)
+  title      String
+  details    String?
+  dueDate    DateTime       @db.Date
+  taxPeriodId String?       @db.Uuid
+  letterId    String?       @db.Uuid
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  deletedAt  DateTime?
+
+  business  Business        @relation(fields: [businessId], references: [id])
+  taxPeriod TaxPeriod?      @relation(fields: [taxPeriodId], references: [id])
+  letter    OfficialLetter? @relation(fields: [letterId], references: [id])
+
+  @@index([businessId, status, dueDate])
+}
+
+enum ExportJobStatus {
+  PENDING
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+model ExportJob {
+  id         String          @id @default(uuid()) @db.Uuid
+  businessId String          @db.Uuid
+  requestedById String       @db.Uuid
+  status     ExportJobStatus @default(PENDING)
+  /// { scope: "year"|"vat-quarter"|"range", from, to, ... }
+  params     Json
+  storageKey String?
+  sizeBytes  Int?
+  sha256     String?
+  /// Manifest summary: counts, missing documents, unresolved items.
+  summary    Json?
+  error      String?
+  startedAt  DateTime?
+  finishedAt DateTime?
+  createdAt  DateTime @default(now())
+
+  business    Business @relation(fields: [businessId], references: [id])
+  requestedBy User     @relation(fields: [requestedById], references: [id])
+
+  @@index([businessId, createdAt])
+}
+
+/// Append-only audit trail. No update/delete path exists in the application;
+/// see docs/SECURITY.md for the recommended DB-level protections.
+model AuditLog {
+  id          String   @id @default(uuid()) @db.Uuid
+  businessId  String?  @db.Uuid
+  actorUserId String?  @db.Uuid
+  action      String // "create" | "update" | "delete" | "confirm" | "lock" | ...
+  entityType  String // "Transaction", "Document", ...
+  entityId    String?
+  oldValues   Json?
+  newValues   Json?
+  reason      String?
+  /// SHA-256 hash of the client IP (raw IPs are never stored) and session id.
+  ipHash      String?
+  sessionId   String?
+  createdAt   DateTime @default(now())
+
+  business Business? @relation(fields: [businessId], references: [id])
+  actor    User?     @relation(fields: [actorUserId], references: [id])
+
+  @@index([businessId, entityType, entityId])
+  @@index([businessId, createdAt])
+}
+
+model SavedFilter {
+  id         String   @id @default(uuid()) @db.Uuid
+  businessId String   @db.Uuid
+  userId     String   @db.Uuid
+  name       String
+  /// Serialized search criteria (JSON) for the search screen.
+  criteria   Json
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+  deletedAt  DateTime?
+
+  business Business @relation(fields: [businessId], references: [id])
+  user     User     @relation(fields: [userId], references: [id])
+
+  @@unique([businessId, userId, name])
+}
