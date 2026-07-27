@@ -31,7 +31,7 @@ export function parseAmountToCents(input: string): number {
   const m = raw.match(/^([+-]?)([\d.,]+)$/);
   if (!m) throw new MoneyError(`Not a valid amount: "${input}"`);
   const sign = m[1] === "-" ? -1 : 1;
-  let body = m[2]!;
+  const body = m[2]!;
 
   const lastComma = body.lastIndexOf(",");
   const lastDot = body.lastIndexOf(".");

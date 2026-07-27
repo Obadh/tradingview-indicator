@@ -7,7 +7,7 @@
  * `UnbalancedJournalError` and the persistence layer re-asserts balance.
  */
 
-import { applyBp, assertCents, sumCents, vatFromNet } from "./money";
+import { applyBp, assertCents, sumCents } from "./money";
 
 export class UnbalancedJournalError extends Error {}
 export class JournalInputError extends Error {}
