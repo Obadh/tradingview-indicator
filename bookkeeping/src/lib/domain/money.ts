@@ -58,6 +58,18 @@ export function parseAmountToCents(input: string): number {
   } else {
     intPart = body;
   }
+  // Any separators left in the integer part must be consistent thousands
+  // grouping (1-3 leading digits, then groups of exactly 3).
+  if (/[.,]/.test(intPart)) {
+    const sep = intPart.includes(".") ? "." : ",";
+    if (intPart.includes(sep === "." ? "," : ".")) {
+      throw new MoneyError(`Not a valid amount: "${input}"`);
+    }
+    const groupPattern = new RegExp(`^\\d{1,3}(\\${sep}\\d{3})+$`);
+    if (!groupPattern.test(intPart)) {
+      throw new MoneyError(`Not a valid amount: "${input}"`);
+    }
+  }
   intPart = intPart.replace(/[.,]/g, "");
   if (!/^\d*$/.test(intPart) || !/^\d*$/.test(fracPart)) {
     throw new MoneyError(`Not a valid amount: "${input}"`);

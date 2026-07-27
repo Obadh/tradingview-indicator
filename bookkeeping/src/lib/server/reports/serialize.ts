@@ -7,6 +7,14 @@ import ExcelJS from "exceljs";
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 import type { ReportData } from "./index";
 
+/** Standard PDF fonts are WinAnsi-only; map/strip characters they lack. */
+export function pdfSafe(s: string): string {
+  return s
+    .replace(/−/g, "-") // Unicode minus
+    .replace(/[‐-―]/g, "-")
+    .replace(/[^\x20-\x7E\xA0-\xFF€‘’“”•…]/g, "?");
+}
+
 export function reportToCsv(report: ReportData): string {
   const escape = (v: string | number) => {
     const s = String(v);
@@ -72,10 +80,10 @@ export async function reportToPdf(report: ReportData): Promise<Buffer> {
     y = pageSize[1] - margin;
   };
 
-  page.drawText(report.title, { x: margin, y, size: 14, font: bold });
+  page.drawText(pdfSafe(report.title), { x: margin, y, size: 14, font: bold });
   y -= 16;
   page.drawText(
-    `Generated ${report.generatedAt} · Period ${report.filters.from} to ${report.filters.to}`,
+    pdfSafe(`Generated ${report.generatedAt} · Period ${report.filters.from} to ${report.filters.to}`),
     { x: margin, y, size: 8, font, color: rgb(0.4, 0.4, 0.4) },
   );
   y -= 20;
@@ -85,7 +93,7 @@ export async function reportToPdf(report: ReportData): Promise<Buffer> {
   const drawRow = (values: (string | number)[], useBold = false) => {
     if (y < margin + 20) newPage();
     values.forEach((v, i) => {
-      const s = String(v ?? "");
+      const s = pdfSafe(String(v ?? ""));
       page.drawText(s.length > 38 ? s.slice(0, 35) + "…" : s, {
         x: margin + i * colWidth,
         y,
@@ -102,7 +110,7 @@ export async function reportToPdf(report: ReportData): Promise<Buffer> {
   if (report.footnote) {
     y -= 8;
     if (y < margin) newPage();
-    page.drawText(report.footnote, { x: margin, y, size: 8, font, color: rgb(0.4, 0.4, 0.4) });
+    page.drawText(pdfSafe(report.footnote), { x: margin, y, size: 8, font, color: rgb(0.4, 0.4, 0.4) });
   }
   return Buffer.from(await doc.save());
 }

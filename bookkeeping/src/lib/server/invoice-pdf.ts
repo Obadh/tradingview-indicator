@@ -6,6 +6,7 @@
 
 import { PDFDocument, StandardFonts, rgb } from "pdf-lib";
 import { centsToDecimalString } from "@/lib/domain/money";
+import { pdfSafe } from "@/lib/server/reports/serialize";
 
 export interface InvoicePdfData {
   kind: "INVOICE" | "CREDIT_NOTE";
@@ -74,7 +75,7 @@ export async function renderInvoicePdf(data: InvoicePdfData): Promise<Buffer> {
     useBold = false,
     color = black,
   ) => {
-    page.drawText(str, { x, y: yy, size, font: useBold ? bold : font, color });
+    page.drawText(pdfSafe(str), { x, y: yy, size, font: useBold ? bold : font, color });
   };
   const money = (cents: number) => `€ ${centsToDecimalString(cents).replace(".", ",")}`;
 

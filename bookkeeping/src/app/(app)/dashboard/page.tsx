@@ -1,5 +1,6 @@
 import Link from "next/link";
 import { requireBusiness } from "@/lib/server/context";
+import { prisma } from "@/lib/server/db";
 import { dashboardData } from "@/lib/server/queries/dashboard";
 import { formatCents } from "@/lib/domain/money";
 import { formatDateNl } from "@/lib/domain/dates";
@@ -45,7 +46,14 @@ function CountTile({ title, count, href }: { title: string; count: number; href:
 export default async function DashboardPage() {
   const { business } = await requireBusiness();
   const settings = business.settings!;
-  const data = await dashboardData(business.id, settings.vatFilingFrequency);
+  const [data, openReminders] = await Promise.all([
+    dashboardData(business.id, settings.vatFilingFrequency),
+    prisma.reminder.findMany({
+      where: { businessId: business.id, status: "OPEN", deletedAt: null },
+      orderBy: { dueDate: "asc" },
+      take: 8,
+    }),
+  ]);
   const resultCents = {
     month: data.month.incomeCents - data.month.expenseCents,
     quarter: data.quarter.incomeCents - data.quarter.expenseCents,
@@ -153,6 +161,31 @@ export default async function DashboardPage() {
           <CountTile title="Unreconciled bank transactions" count={data.unreconciledBankLines} href="/banking?state=unreconciled" />
         </div>
       </section>
+
+      {openReminders.length > 0 && (
+        <section aria-labelledby="reminders-heading" className="space-y-2">
+          <h2 id="reminders-heading" className="font-medium">
+            Reminders
+          </h2>
+          <Card>
+            <CardContent className="space-y-1 p-4 text-sm">
+              {openReminders.map((r) => (
+                <p key={r.id}>
+                  <span className="font-medium">{formatDateNl(r.dueDate)}</span> — {r.title}
+                  {r.letterId && (
+                    <>
+                      {" "}
+                      <Link className="text-primary underline" href="/letters">
+                        (letter)
+                      </Link>
+                    </>
+                  )}
+                </p>
+              ))}
+            </CardContent>
+          </Card>
+        </section>
+      )}
 
       <section aria-labelledby="completeness-heading" className="space-y-2">
         <h2 id="completeness-heading" className="font-medium">

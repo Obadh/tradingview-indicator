@@ -4,6 +4,8 @@ import { prisma } from "@/lib/server/db";
 import { RegisterForm } from "./register-form";
 
 export const metadata = { title: "Create owner account" };
+// The page checks the live user count — never prerender it at build time.
+export const dynamic = "force-dynamic";
 
 export default async function RegisterPage() {
   const userCount = await prisma.user.count();
